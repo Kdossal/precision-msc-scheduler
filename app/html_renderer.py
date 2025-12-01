@@ -1,49 +1,47 @@
-# app/html_renderer.py
-
 from app.utils import time_slots
 
 
 # -------------------------------------------------------------
-#    Build Day Tables
+#    Build Day Tables (with alternating row colors)
 # -------------------------------------------------------------
-def _build_single_day_rows(day_name, timeslot_map, include_booth=False):
+def _build_single_day_rows(day_name, timeslot_map, include_booth=False, include_category=False):
     html = ""
+    row_index = 0
 
     for t, blocked_reason in time_slots[day_name].items():
 
-        # if this is a LUNCH or BREAK slot
+        # Row color selection — darker grey
+        bg = "#FFFFFF" if row_index % 2 == 0 else "#F2F2F2"
+
+        # --------------------------
+        # LUNCH / BREAK Rows
+        # --------------------------
         if blocked_reason == "LUNCH":
             html += f"""
-            <tr>
+            <tr style="background:{bg};">
                 <td>{t}</td>
-                <td colspan="2" style="color:#C63434; font-weight:600;">LUNCH</td>
-            </tr>
-            """ if include_booth else f"""
-            <tr>
-                <td>{t}</td>
-                <td style="color:#C63434; font-weight:600;">LUNCH</td>
+                <td colspan="3" style="color:#C63434; font-weight:600;">LUNCH</td>
             </tr>
             """
+            row_index += 1
             continue
 
         if blocked_reason == "BREAK":
             html += f"""
-            <tr>
+            <tr style="background:{bg};">
                 <td>{t}</td>
-                <td colspan="2" style="color:#C63434; font-weight:600;">BREAK</td>
-            </tr>
-            """ if include_booth else f"""
-            <tr>
-                <td>{t}</td>
-                <td style="color:#C63434; font-weight:600;">BREAK</td>
+                <td colspan="3" style="color:#C63434; font-weight:600;">BREAK</td>
             </tr>
             """
+            row_index += 1
             continue
 
-        # Normal slot
+        # --------------------------
+        # Normal appointment row
+        # --------------------------
         val = timeslot_map.get((day_name, t), "--AVAILABLE--")
 
-        if include_booth:
+        if include_booth:  # Representative schedule
             if val == "--AVAILABLE--":
                 supplier = "--AVAILABLE--"
                 booth = ""
@@ -52,25 +50,36 @@ def _build_single_day_rows(day_name, timeslot_map, include_booth=False):
                 booth = val["booth"]
 
             html += f"""
-            <tr>
+            <tr style="background:{bg};">
                 <td>{t}</td>
                 <td>{booth}</td>
                 <td>{supplier}</td>
             </tr>
             """
-        else:
+
+        else:  # Supplier schedule
+            if val == "--AVAILABLE--":
+                rep = "--AVAILABLE--"
+                category = ""
+            else:
+                rep = val["rep"]
+                category = val.get("category", "")
+
             html += f"""
-            <tr>
+            <tr style="background:{bg};">
                 <td>{t}</td>
-                <td>{val}</td>
+                <td>{rep}</td>
+                {"<td>"+category+"</td>" if include_category else ""}
             </tr>
             """
+
+        row_index += 1
 
     return html
 
 
 # -------------------------------------------------------------
-#     COMMON CSS (used by all pages)
+#     COMMON CSS
 # -------------------------------------------------------------
 COMMON_CSS = """
 @page { margin: 0; }
@@ -105,52 +114,70 @@ body {
     color: #444;
 }
 
+.grid-container {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    gap: 0px;
+    width: 95%;
+    margin: 20px auto 0 auto;
+}
+
+.grid-cell {
+    padding: 5px 10px;
+}
+
 .section-title {
     text-align: center;
-    font-size: 20px;
+    font-size: 18px;
     font-weight: 600;
-    margin-top: 30px;
-    margin-bottom: 10px;
+    margin: 6px 0 6px 0;
     color: #5533FF;
 }
 
-.disclaimer {
-    width: 80%;
-    margin: 0 auto 40px auto;
-    font-size: 13px;
-    color: #C63434;
-    text-align: left;
-}
-
 table {
-    width: 80%;
-    margin: 0 auto 30px auto;
+    width: 100%;
     border-collapse: collapse;
     background: white;
-    border-radius: 6px;
-    border: 1px solid #ddd;
 }
 
+/* ✔ FIX: Left-align header + cells */
 th {
     background: #5533FF;
     color: white;
-    padding: 10px;
+    padding: 6px;
+    font-size: 14px;
     text-align: left;
 }
 
 td {
-    padding: 8px;
-    border-bottom: 1px solid #ddd;
+    padding: 6px;
+    font-size: 13px;
+    text-align: left;
 }
 
-tr:last-child td {
-    border-bottom: none;
+.summary-box {
+    width: 95%;
+    margin: 0 auto;
+    padding: 12px;
+    border-radius: 6px;
+    font-size: 14px;
+    background: #F7F4FF;
+    border: 1px solid #DDD;
 }
 
 .top-info {
     text-align: center;
     font-size: 17px;
     margin-top: 15px;
+}
+
+.endnote {
+    width: 90%;
+    margin: 15px auto;
+    font-size: 13px;
+    color: #C63434;
+    text-align: left;
 }
 
 .print-button {
@@ -176,65 +203,83 @@ tr:last-child td {
 # ===================================================================
 #                 SUPPLIER HTML
 # ===================================================================
-def render_supplier_html(supplier_name, booth, schedule_df):
-
+def render_supplier_html(supplier_name, booth, schedule_df, supplier_summary):
     data_map = {}
     for _, r in schedule_df.iterrows():
-        data_map[(r["day"], r["timeslot"])] = r.get("rep", "--AVAILABLE--")
+        data_map[(r["day"], r["timeslot"])] = {
+            "rep": r.get("rep", "--AVAILABLE--"),
+            "category": r.get("category", "")
+        }
 
-    html = f"""
+    requested = supplier_summary["requested"]
+    fulfilled = set(supplier_summary["fulfilled"])
+
+    summary_lines = []
+    for cat in requested:
+        if cat in fulfilled:
+            summary_lines.append(f"{cat}")
+        else:
+            summary_lines.append(f"{cat} <span style='color:#C63434;'>[UNAVAILABLE]</span>")
+
+    # 3-day grid layout — top-left, top-right, bottom-left
+    day_cells = ""
+    for day in time_slots.keys():
+        day_cells += f"""
+        <div class="grid-cell">
+            <div class="section-title">{day}</div>
+            <table>
+                <tr><th>Time</th><th>Appointment with</th><th>Category</th></tr>
+                {_build_single_day_rows(day, data_map, include_booth=False, include_category=True)}
+            </table>
+        </div>
+        """
+
+    summary_cell = f"""
+    <div class="grid-cell">
+        <div class="section-title">Request Summary</div>
+        <div class="summary-box">
+            {"<br>".join(summary_lines)}
+        </div>
+    </div>
+    """
+
+    return f"""
     <html>
     <head>
         <meta charset="UTF-8">
-
         <style>{COMMON_CSS}</style>
-
-        <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@300;400;500;600&display=swap"
-              rel="stylesheet">
+        <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@300;400;500;600&display=swap" rel="stylesheet">
     </head>
 
     <body>
 
         <div class="title">2026 Supplier Growth Summit</div>
-        <div class="subtitle">XXXXXXX January XXth through XXXXXXX January XXth</div>
-
+        <div class="subtitle">February 23rd – 25th</div>
         <div class="top-info">{supplier_name} — Booth {booth}</div>
 
         <div class="print-container no-print">
             <a class="print-button" onclick="window.print()" href="javascript:void(0)">Save PDF</a>
         </div>
 
-        <div class="section-title">Day 1</div>
+        <div class="grid-container">
+            {day_cells}
+            {summary_cell}
+        </div>
 
-        <table>
-            <tr><th>Time:</th><th>Appointment with:</th></tr>
-            {_build_single_day_rows("Day 1", data_map)}
-        </table>
-
-        <div class="section-title">Day 2</div>
-
-        <table>
-            <tr><th>Time:</th><th>Appointment with:</th></tr>
-            {_build_single_day_rows("Day 2", data_map)}
-        </table>
-
-        <div class="disclaimer">
-            Some Members may have free slots. If you're looking to connect with a
-            Sales Representative, consult with our Information Desk Staff for Member availability.
+        <div class="endnote">
+            Some Members may have free slots. If you're looking to connect with a Sales Representative,
+            consult with our Information Desk Staff for Member availability.
         </div>
 
     </body>
     </html>
     """
 
-    return html
-
 
 # ===================================================================
 #                 REP HTML
 # ===================================================================
 def render_rep_html(rep_name, schedule_df, suppliers_df):
-
     data_map = {}
 
     for _, r in schedule_df.iterrows():
@@ -246,84 +291,74 @@ def render_rep_html(rep_name, schedule_df, suppliers_df):
                 suppliers_df["Supplier"] == supplier, "Booth #"
             ].iloc[0]
             val = {"supplier": supplier, "booth": booth}
-
         data_map[(r["day"], r["timeslot"])] = val
 
-    html = f"""
+    day_cells = ""
+    for day in time_slots.keys():
+        day_cells += f"""
+        <div class="grid-cell">
+            <div class="section-title">{day}</div>
+            <table>
+                <tr><th>Time</th><th>Booth</th><th>Supplier</th></tr>
+                {_build_single_day_rows(day, data_map, include_booth=True, include_category=False)}
+            </table>
+        </div>
+        """
+
+    empty_cell = "<div class='grid-cell'></div>"
+
+    return f"""
     <html>
     <head>
         <meta charset="UTF-8">
-
-        <style>{COMMON_CSS}</style>
-
-        <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@300;400;500;600&display=swap"
-              rel="stylesheet">
+        <style>{COMMON_CSS}></style>
+        <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@300;400;500;600&display=swap" rel="stylesheet">
     </head>
 
     <body>
 
         <div class="title">2026 Supplier Growth Summit</div>
-        <div class="subtitle">XXXXXXX January XXth through XXXXXXX January XXth</div>
-
+        <div class="subtitle">February 23rd – 25th</div>
         <div class="top-info">{rep_name}</div>
 
         <div class="print-container no-print">
             <a class="print-button" onclick="window.print()" href="javascript:void(0)">Save PDF</a>
         </div>
 
-        <div class="section-title">Day 1</div>
-        <table>
-            <tr><th>Time:</th><th>Booth:</th><th>Appointment with:</th></tr>
-            {_build_single_day_rows("Day 1", data_map, include_booth=True)}
-        </table>
+        <div class="grid-container">
+            {day_cells}
+            {empty_cell}
+        </div>
 
-        <div class="section-title">Day 2</div>
-        <table>
-            <tr><th>Time:</th><th>Booth:</th><th>Appointment with:</th></tr>
-            {_build_single_day_rows("Day 2", data_map, include_booth=True)}
-        </table>
-
-        <div class="disclaimer">
+        <div class="endnote">
             If you have a Sponsor Suite meeting, you don't have to keep the Floor appointment.<br>
-            During free slots, please visit with our Associate and Program Suppliers
-            that don't have rotation appointments.
+            During free slots, please visit with our Associate and Program Suppliers that don't have rotation appointments.
         </div>
 
     </body>
     </html>
     """
 
-    return html
-
 
 # ===================================================================
 #      Build Combined HTML for Print-All
 # ===================================================================
 def build_combined_html(html_pages):
-    """Combine many full HTML pages into ONE printable HTML with page breaks."""
-
-    # Extract <head> contents from first page
     first = html_pages[0]
     head = first.split("<head>")[1].split("</head>")[0]
 
     combined = []
-
     for idx, page in enumerate(html_pages):
         body = page.split("<body>")[1].split("</body>")[0]
 
-        # Only add page break if not last page
         if idx < len(html_pages) - 1:
             combined.append(f"""
-                <div class="schedule-page">
-                    {body}
-                </div>
-                <div class="page-break"></div>
+            <div class="schedule-page">{body}</div>
+            <div class="page-break"></div>
             """)
         else:
             combined.append(f"""
-                <div class="schedule-page">
-                    {body}
-                </div>
+            <div class="schedule-page">{body}</div>
             """)
 
     return f"""
@@ -336,14 +371,5 @@ def build_combined_html(html_pages):
     """
 
 
-
-# ===================================================================
-#     html_to_pdf — Browser-based, no wkhtmltopdf, no subprocess
-# ===================================================================
 def html_to_pdf(html):
-    """
-    This function does NOT create PDFs itself.
-    It returns HTML that the browser can print as PDF.
-    The backend does NOT generate PDFs.
-    """
     return html
