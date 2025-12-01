@@ -23,7 +23,7 @@ def render_header(logo_path: str):
             margin-bottom:12px;
         ">
             <h1 style="color:white; margin:0; font-family:'Barlow', sans-serif;">
-                Supplier Growth Forum Scheduler Demo
+                Supplier Growth Forum Scheduler
             </h1>
         </div>
         """,
