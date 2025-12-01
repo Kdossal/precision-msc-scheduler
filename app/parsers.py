@@ -1,14 +1,25 @@
 import pandas as pd
 
 def parse_matrix_file(file):
-    # read entire workbook
     suppliers_df = pd.read_excel(file, sheet_name="Suppliers")
     reps_df = pd.read_excel(file, sheet_name="Sales Reps.")
 
-    pref_cols = suppliers_df.columns[3:]  # first 3 columns are Supplier, Booth, Type
+    # grab all Request columns
+    pref_cols = [c for c in suppliers_df.columns if c.startswith("Request")]
 
-    # create preference matrix: rows = suppliers, cols = categories
-    preferences_matrix = suppliers_df[["Supplier"] + list(pref_cols)].copy()
-    preferences_matrix.set_index("Supplier", inplace=True)
+    # create preference dict per supplier (ordered list)
+    preferences = {}
 
-    return suppliers_df, reps_df, preferences_matrix
+    for _, row in suppliers_df.iterrows():
+        supplier = row["Supplier"]
+
+        requests = []
+        for c in pref_cols:
+            val = row[c]
+            if pd.isna(val): 
+                continue
+            requests.append(str(val).strip())
+
+        preferences[supplier] = requests
+
+    return suppliers_df, reps_df, preferences
