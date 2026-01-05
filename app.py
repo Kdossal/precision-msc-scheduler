@@ -31,9 +31,9 @@ def main():
 
         #### Source Data and Definitions
 
-        Supplier type and opportunity data come from the Supplier Growth Forum model outputs.  
-        The list of attending Sales Representatives comes from the MSC invite list provided by Leah Bacon on Dec. 23rd.  
-        Supplier meeting requests come from the Meeting Tracker and include each supplier's meeting number, topic, and preferred attendee type or region.
+        Supplier type and opportunity data come from the respective Supplier Growth Forum model outputs.  
+        The list of attending Sales Representatives comes from the *Internal MSC Invite List In Progress_19DESC.xlsx* provided by Leah Bacon on Dec. 23rd.  
+        Supplier meeting requests come from *Supplier Growth Forum Insights – Meeting Tracker*.
 
         Request cleaning follows these principles:  
         - Use explicit region or name requests when provided  
@@ -242,4 +242,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
