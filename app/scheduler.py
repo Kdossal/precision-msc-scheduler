@@ -38,9 +38,9 @@ def expand_region_request(att_list, supplier_type, reps_df):
 
     # ideal roles
     if supplier_type == "Peak":
-        roles = [3, 2, 1]
+        roles = [3, 2]
     else:
-        roles = [2, 1, 1]
+        roles = [2, 1]
 
     out = []
     for w in roles:
@@ -298,6 +298,10 @@ def build_phase2_cleaned_requests(preferences, reps_df, max_meetings_rep=12):
 
             m["requested_attendees"] = new_list
 
+    # manual override
+    cleaned['Simple Green'][0]['requested_attendees'] = ['Matthew Borich', 'William Hollenbach III', 'Dawn Cormier']
+    cleaned['Brady'][0]['requested_attendees'] = ['Tom Birchard', 'Ali Mccraw', 'Clayton Davis']
+
     # Mark unavailable reps in NAME requests
     for supp, meetings in cleaned.items():
         for m in meetings:
@@ -388,24 +392,94 @@ def build_validation_report(cleaned_prefs, supplier_schedule, reps_schedule, sup
     return report
 
 
+def shuffle_timeslots(supplier_df, reps_df, seed=42):
+    """
+    Shuffle ALL timeslots globally while keeping the meeting assignments identical.
+
+    Example:
+        Tuesday 8am  -> Wednesday 10am
+        Tuesday 9am  -> Tuesday 3pm
+        etc.
+
+    This is a bijection mapping (one-to-one).
+    """
+
+    # ----------------------------------------------------
+    # 1. Collect all valid timeslots
+    # ----------------------------------------------------
+    all_slots = []
+    for day, mapping in time_slots.items():
+        for slot, state in mapping.items():
+            if state not in ("LUNCH", "BREAK"):
+                all_slots.append((day, slot))
+
+    # Safety
+    if len(all_slots) == 0:
+        return supplier_df, reps_df
+
+    # ----------------------------------------------------
+    # 2. Shuffle timeslots
+    # ----------------------------------------------------
+    rng = np.random.default_rng(seed)
+    shuffled = all_slots.copy()
+    rng.shuffle(shuffled)
+
+    # Build mapping dict
+    remap = {old: new for old, new in zip(all_slots, shuffled)}
+
+    # ----------------------------------------------------
+    # 3. Apply mapping to supplier schedule
+    # ----------------------------------------------------
+    supplier_df = supplier_df.copy()
+    supplier_df["day_new"] = supplier_df.apply(
+        lambda r: remap[(r["day"], r["timeslot"])][0],
+        axis=1
+    )
+    supplier_df["timeslot_new"] = supplier_df.apply(
+        lambda r: remap[(r["day"], r["timeslot"])][1],
+        axis=1
+    )
+    supplier_df.drop(columns=["day", "timeslot"], inplace=True)
+    supplier_df.rename(columns={"day_new": "day", "timeslot_new": "timeslot"}, inplace=True)
+
+    # ----------------------------------------------------
+    # 4. Apply mapping to rep schedule
+    # ----------------------------------------------------
+    reps_df = reps_df.copy()
+    reps_df["day_new"] = reps_df.apply(
+        lambda r: remap[(r["day"], r["timeslot"])][0],
+        axis=1
+    )
+    reps_df["timeslot_new"] = reps_df.apply(
+        lambda r: remap[(r["day"], r["timeslot"])][1],
+        axis=1
+    )
+    reps_df.drop(columns=["day", "timeslot"], inplace=True)
+    reps_df.rename(columns={"day_new": "day", "timeslot_new": "timeslot"}, inplace=True)
+
+    return supplier_df, reps_df
+
 def build_phase3_create_schedules(preferences,
                                   reps_df,
                                   max_meetings_rep=12,
                                   max_peak=6,
                                   max_acc=3,
                                   seed=42):
+
     """
-    Phase 3: Use Phase 2 cleaned attendee lists and attempt to schedule all meetings
-    with no added fallback logic.
+    Phase 3: Use Phase 2 cleaned attendee lists and attempt to schedule all meetings,
+    then shuffle timeslots globally.
     """
 
     # ------------------------------------------------------
     # Step 1: Run Phase 2 preprocessing
     # ------------------------------------------------------
-    cleaned_prefs, rep_summary = build_phase2_cleaned_requests(preferences, reps_df, max_meetings_rep)
+    cleaned_prefs, rep_summary = build_phase2_cleaned_requests(
+        preferences, reps_df, max_meetings_rep
+    )
 
     # ------------------------------------------------------
-    # Step 2: Track availability
+    # Step 2: Track rep availability
     # ------------------------------------------------------
     rep_avail = {
         rep: {
@@ -422,20 +496,18 @@ def build_phase3_create_schedules(preferences,
     sup_summary = {}
 
     # ------------------------------------------------------
-    # Step 3: Build supplier scheduling order
+    # Step 3: Supplier scheduling order
     # ------------------------------------------------------
     suppliers = list(cleaned_prefs.keys())
 
     def sort_key(supp):
-        meetings = cleaned_prefs[supp]
-        supplier_type = meetings[0]["supplier_type"]
-        is_peak = 0 if supplier_type == "Peak" else 1
-        return (is_peak, )
+        t = cleaned_prefs[supp][0]["supplier_type"]
+        return 0 if t == "Peak" else 1
 
     suppliers = sorted(suppliers, key=sort_key)
 
     # ------------------------------------------------------
-    # Timeslots (fixed order so reproducible)
+    # Step 4: All usable timeslots
     # ------------------------------------------------------
     def all_slots():
         out = []
@@ -451,7 +523,7 @@ def build_phase3_create_schedules(preferences,
     np.random.seed(seed)
 
     # ------------------------------------------------------
-    # Step 4: Actual scheduling
+    # Step 5: Scheduling loop
     # ------------------------------------------------------
     for supp in suppliers:
 
@@ -464,76 +536,72 @@ def build_phase3_create_schedules(preferences,
         sup_summary[supp] = {
             "requested": [],
             "fulfilled": [],
-            "substitutions": {}
+            "substitutions": {},
+            "req_types": {},
         }
 
         used_count = 0
 
         for m in sorted(meetings, key=lambda x: x["meeting_number"]):
 
-            requested_name = m["request_name"]
+            req_name = m["request_name"]
             attendees = m["requested_attendees"]
+            tot_opp = m.get("total_opportunity", 0.0)
+            type = m["request_type"]
 
-            # record the request name (but maybe not final requested list)
-            sup_summary[supp]["requested"].append(requested_name)
+            sup_summary[supp]["requested"].append(req_name)
 
-            # if already at max cap → stop showing future requests
             if used_count >= cap:
                 break
 
-            # ------------------------------------------------------
-            # Attempt to find a slot for these attendees
-            # ------------------------------------------------------
             assigned = False
 
             for day, slot in slot_order:
 
-                # supplier already has a meeting then skip slot
-                supplier_has_slot = any(
-                    (row["supplier"] == supp and row["day"] == day and row["timeslot"] == slot)
-                    for row in supplier_rows
+                supplier_double = any(
+                    r["supplier"] == supp and r["day"] == day and r["timeslot"] == slot
+                    for r in supplier_rows
                 )
-                if supplier_has_slot:
+                if supplier_double:
                     continue
 
-                # all attendees must be available
-                ok = True
+                available = True
                 for rep in attendees:
                     if rep_meet_count[rep] >= max_meetings_rep:
-                        ok = False
-                        break
-                    if rep not in rep_avail:
-                        ok = False
+                        available = False
                         break
                     if not rep_avail[rep][day][slot]:
-                        ok = False
+                        available = False
                         break
-
-                if not ok:
+                if not available:
                     continue
 
-                # found a valid slot
+                # Assign meeting
                 assigned = True
                 used_count += 1
-                sup_summary[supp]["fulfilled"].append(requested_name)
+                sup_summary[supp]["fulfilled"].append(req_name)
 
-                # if Phase 2 created unavailable list for this meeting
-                if "unavailable" in m:
-                    sup_summary[supp]["substitutions"][requested_name] = m["unavailable"]
-                else:
-                    sup_summary[supp]["substitutions"][requested_name] = []
+                # Missing names → substitutions
+                subs = m["unavailable"] if "unavailable" in m else []
+                sup_summary[supp]["substitutions"][req_name] = subs
+                sup_summary[supp]["req_types"][req_name] = type
 
-                # record supplier schedule row
+                # --------------------------
+                # Write Supplier schedule row
+                # --------------------------
                 supplier_rows.append({
                     "supplier": supp,
                     "booth": booth,
                     "day": day,
                     "timeslot": slot,
                     "reps": attendees,
-                    "category": requested_name
+                    "category": req_name,
+                    "total_opportunity": tot_opp
                 })
 
-                # record each rep
+                # --------------------------
+                # Write Rep schedule rows
+                # --------------------------
                 for rep in attendees:
                     rep_rows.append({
                         "rep": rep,
@@ -541,31 +609,52 @@ def build_phase3_create_schedules(preferences,
                         "timeslot": slot,
                         "supplier": supp,
                         "booth": booth,
-                        "category": requested_name
+                        "category": req_name,
+                        "total_opportunity": tot_opp
                     })
+
                     rep_avail[rep][day][slot] = False
                     rep_meet_count[rep] += 1
 
-                break  # leave slot loop
+                break  # stop searching for slots
 
-            # no slot found → not fulfilled, record substitutions only
             if not assigned:
-                if "unavailable" in m:
-                    sup_summary[supp]["substitutions"][requested_name] = m["unavailable"]
-                else:
-                    sup_summary[supp]["substitutions"][requested_name] = []
+                sup_summary[supp]["substitutions"][req_name] = \
+                    m["unavailable"] if "unavailable" in m else []
 
-        # ------------------------------------------------------
-        # If we fulfilled < cap, keep showing all requests
-        # If we fulfilled == cap, truncate requested list
-        # ------------------------------------------------------
-        if len(sup_summary[supp]["fulfilled"]) == cap:
-            sup_summary[supp]["requested"] = sup_summary[supp]["requested"][:cap]
+        if cap > 0:
+            new_requested = []
+            fulfilled_count = 0
 
+            for req in sup_summary[supp]["requested"]:
+                new_requested.append(req)
+
+                if req in sup_summary[supp]["fulfilled"]:
+                    fulfilled_count += 1
+
+                # stop as soon as we have shown *cap* fulfilled meetings
+                if fulfilled_count >= cap:
+                    break
+
+            sup_summary[supp]["requested"] = new_requested
+
+    # Convert to DataFrames (now with opportunity values)
     supplier_df = pd.DataFrame(supplier_rows)
     reps_df_sched = pd.DataFrame(rep_rows)
 
-    validation = build_validation_report(cleaned_prefs, supplier_df, reps_df_sched, sup_summary)
+    # ------------------------------------------------------
+    # Shuffle timeslots globally
+    # ------------------------------------------------------
+    supplier_df, reps_df_sched = shuffle_timeslots(
+        supplier_df, reps_df_sched, seed=seed
+    )
+
+    # ------------------------------------------------------
+    # Final validation
+    # ------------------------------------------------------
+    validation = build_validation_report(
+        cleaned_prefs, supplier_df, reps_df_sched, sup_summary
+    )
 
     return supplier_df, reps_df_sched, sup_summary, validation
 
