@@ -3,7 +3,7 @@ import numpy as np
 
 
 # ------------------------------------------------------
-# Clean & validate Phase 1 preferences
+# Clean & validate Preferences
 # ------------------------------------------------------
 def clean_and_validate_requests(preferences):
     cleaned = {}
@@ -30,9 +30,6 @@ def clean_and_validate_requests(preferences):
     return cleaned
 
 
-# ------------------------------------------------------
-# Updated parser that mimics old logic but supports new data structure
-# ------------------------------------------------------
 def parse_meeting_organizer(file_path):
 
     # Load sheets
@@ -67,20 +64,26 @@ def parse_meeting_organizer(file_path):
         "Email": "Email",
     })
 
-    # Ensure clean string types
     reps_df["Segment"] = reps_df["Segment"].fillna("").astype(str)
     reps_df["Region"] = reps_df["Region"].fillna("").astype(str)
+
+    # Ensure numeric weights
+    reps_df["Weight"] = pd.to_numeric(reps_df["Weight"], errors="coerce").fillna(1).astype(int)
 
     # ------------------------------------------------------
     # 3. Build preferences dict (supplier → list of meetings)
     # ------------------------------------------------------
     requests_by_supplier = {}
 
+    # Ensure numeric opportunity columns
+    req_df["Penetration Clean"] = pd.to_numeric(req_df["Penetration Clean"], errors="coerce").fillna(0)
+    req_df["Acquisition Clean"] = pd.to_numeric(req_df["Acquisition Clean"], errors="coerce").fillna(0)
+
     for _, row in req_df.iterrows():
+
         supplier = str(row["Supplier Name"]).strip()
         meeting_num = int(row["Meeting #"])
 
-        # Clean attendees list
         attendees_raw = str(row["Request Clean"]).strip()
         attendees = [
             a.strip()
@@ -88,18 +91,24 @@ def parse_meeting_organizer(file_path):
             if a.strip() not in ("", None)
         ]
 
+        pen = float(row["Penetration Clean"])
+        acq = float(row["Acquisition Clean"])
+        total = pen + acq
+
         meeting_entry = {
             "meeting_number": meeting_num,
             "supplier_name": supplier,
             "supplier_type": row["Supplier Type"],
             "booth": row["Booth #"],
             "request_name": row["Request Name"],
+            "total_opportunity": total,
+            "request_type": row["Request Type"],
             "attendees": attendees,
         }
 
         requests_by_supplier.setdefault(supplier, []).append(meeting_entry)
 
-    # Sort incoming meetings
+    # Sort incoming meetings by Meeting #
     for supplier in requests_by_supplier:
         requests_by_supplier[supplier] = sorted(
             requests_by_supplier[supplier],
@@ -107,7 +116,7 @@ def parse_meeting_organizer(file_path):
         )
 
     # ------------------------------------------------------
-    # 4. Clean and reassign numbers
+    # 4. Clean & normalize meetings
     # ------------------------------------------------------
     cleaned_preferences = clean_and_validate_requests(requests_by_supplier)
 
