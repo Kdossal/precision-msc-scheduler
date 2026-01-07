@@ -1,4 +1,4 @@
-# **Supplier Growth Forum Scheduler (Demo Application)**
+# **Supplier Growth Forum Scheduler**
 
 A Streamlit-based application for generating, viewing, and exporting structured meeting schedules for Suppliers and Sales Representatives for the **Supplier Growth Summit**. This tool is an automated Python scheduler that outputs PDF ready HTML.
 
@@ -42,29 +42,6 @@ README.md
 requirements.txt
 ```
 
-
-## **Input Format**
-
-The uploaded Excel file must include:
-
-### **Sheet: `Suppliers`**
-
-Required columns:
-
-* `Supplier`
-* `Booth #`
-* `Type` (Peak / Accelerating)
-
-### **Sheet: `Sales Reps.`**
-
-Required columns:
-
-* `Sales Rep.`
-* `Category`
-* `Ranking`
-
----
-
 ## **Installation**
 
 Make sure you have Python 3.9+ installed.
@@ -93,4 +70,5 @@ Known limitations:
 * Scheduling is greedy; advanced optimization not implemented
 
 These can be expanded for a production version.
+
 
