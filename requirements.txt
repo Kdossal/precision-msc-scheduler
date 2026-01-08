@@ -3,3 +3,4 @@ pandas
 numpy
 openpyxl
 PyPDF2
+xlsxwriter
