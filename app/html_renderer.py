@@ -1,4 +1,4 @@
-from app.utils import time_slots
+from app.utils import time_slots, blocks, act_session_times
 import pandas as pd
 
 # =====================================================================
@@ -8,92 +8,165 @@ def _format_millions(x):
     if x is None or x == "" or pd.isna(x):
         return ""
     if x == 0:
-        return "-"
-    return f"${x/1_000_000:,.1f}M"
+        return "n/a"
+    if abs(x) < 1_000_000:
+        return f"${int(round(x / 1_000)):,.0f}k"
+    return f"${x / 1_000_000:,.1f}M"
 
-def _build_single_day_rows(day_name, data_map, *, mode):
+
+def _build_single_day_rows(day_name, data_map, supplier_name=None, *, mode):
     """
-    mode = "supplier" → columns: Time | Request | Appointment With | Opp. $
-    mode = "rep"      → columns: Time | Location | Supplier | Opp. $
+    mode:
+      supplier_full   → Time | Session | Request | Appointment With | Opp. $
+      supplier_light  → Time | Session | Request | Appointment With
+      rep             → Time | Location | Session | Supplier | Opp. $
     """
 
     html = ""
     row_idx = 0
+    day_blocks = blocks.get(day_name, {})
+    slot_list = list(time_slots[day_name].keys())
+    n = len(slot_list)
+    i = 0
 
-    for t, blocked in time_slots[day_name].items():
-
+    while i < n:
+        t = slot_list[i]
+        default_marker = time_slots[day_name][t]
         bg = "#FFFFFF" if row_idx % 2 == 0 else "#F7F7F7"
 
-        # LUNCH
-        if blocked == "LUNCH":
-            html += f"""
-            <tr style="background:{bg};">
-                <td>{t}</td>
-                <td colspan="3" style="font-weight:600; color:#C63434;">LUNCH</td>
-            </tr>
-            """
+        # ----------------------------------
+        # Lunch / Break
+        # ----------------------------------
+        if default_marker in ("LUNCH", "BREAK"):
+            cells = f"<td>{t}</td><td></td><td style='font-weight:600; color:#C63434;'>{default_marker}</td><td></td>"
+            if mode == "supplier_full" or mode == "rep":
+                cells += "<td></td>"
+
+            html += f"<tr style='background:{bg};'>{cells}</tr>"
+            i += 1
             row_idx += 1
             continue
 
-        # BREAK
-        if blocked == "BREAK":
-            html += f"""
-            <tr style="background:{bg};">
-                <td>{t}</td>
-                <td colspan="3" style="font-weight:600; color:#C63434;">BREAK</td>
-            </tr>
-            """
+        # ----------------------------------
+        # Supplier Innovation block
+        # ----------------------------------
+        if mode.startswith("supplier") and supplier_name:
+            blocked = day_blocks.get(t, [])
+            if supplier_name in blocked:
+                time_cell = act_session_times.get(supplier_name, t)
+
+                j = i + 1
+                while j < n and supplier_name in day_blocks.get(slot_list[j], []):
+                    j += 1
+                i = j
+
+                cells = f"""
+                    <td>{time_cell}</td>
+                    <td></td>
+                    <td>Innovation Theater Presentation</td>
+                    <td></td>
+                """
+                if mode == "supplier_full":
+                    cells += "<td></td>"
+
+                html += f"<tr style='background:{bg};'>{cells}</tr>"
+                row_idx += 1
+                continue
+
+        # ----------------------------------
+        # Lookup scheduled meeting
+        # ----------------------------------
+        val = data_map.get((day_name, t))
+
+        if not val:
+            cells = f"<td>{t}</td><td></td><td>--AVAILABLE--</td><td></td>"
+            if mode in ("supplier_full", "rep"):
+                cells += "<td></td>"
+
+            html += f"<tr style='background:{bg};'>{cells}</tr>"
+            i += 1
             row_idx += 1
             continue
 
-        val = data_map.get((day_name, t), None)
+        session = val["session_type"]
 
-        if mode == "supplier":
-            if val is None:
-                req = ""
-                reps = "--AVAILABLE--"
-                opp = ""
-            else:
-                req = val.get("category", "")
-                reps = val.get("rep", "--AVAILABLE--")
-                opp = _format_millions(val.get("opportunity", ""))
+        # ----------------------------------
+        # Innovation Theater (rep view)
+        # ----------------------------------
+        if mode == "rep" and session == "Innovation Theater":
+            supplier = val.get("supplier", "")
+            time_cell = act_session_times.get(supplier, t)
 
-            html += f"""
-            <tr style="background:{bg};">
-                <td>{t}</td>
-                <td>{req}</td>
-                <td>{reps}</td>
-                <td>{opp}</td>
-            </tr>
-            """
-
-        elif mode == "rep":
-            if val is None:
-                booth = ""
-                supplier = "--AVAILABLE--"
-                opp = ""
-            else:
-                booth = "TBD" # val.get("booth", "")
-                supplier = val.get("supplier", "--AVAILABLE--")
-                opp = _format_millions(val.get("opportunity", ""))
+            j = i + 1
+            while j < n:
+                nxt = data_map.get((day_name, slot_list[j]))
+                if nxt and nxt.get("session_type") == "Innovation Theater" and nxt.get("supplier") == supplier:
+                    j += 1
+                else:
+                    break
+            i = j
 
             html += f"""
             <tr style="background:{bg};">
-                <td>{t}</td>
-                <td>{booth}</td>
+                <td>{time_cell}</td>
+                <td>TBD</td>
+                <td>Innovation Theater</td>
                 <td>{supplier}</td>
-                <td>{opp}</td>
+                <td></td>
             </tr>
             """
+            row_idx += 1
+            continue
 
+        # ----------------------------------
+        # Strategy merge (2-slot)
+        # ----------------------------------
+        time_cell = t
+        if session == "Strategy" and i + 1 < n:
+            nxt = data_map.get((day_name, slot_list[i + 1]))
+            if nxt and nxt.get("session_type") == "Strategy" and nxt.get("category") == val.get("category"):
+                time_cell = f"<div style='height:3mm'></div>{t}<div style='height:3mm'></div>"
+                i += 2
+            else:
+                i += 1
+        else:
+            i += 1
+
+        # ----------------------------------
+        # Render rows
+        # ----------------------------------
+        if mode.startswith("supplier"):
+            opp_cell = ""
+            if mode == "supplier_full" and session not in ("Power Pairing",):
+                opp_cell = _format_millions(val.get("opportunity", ""))
+
+            cells = f"""
+                <td>{time_cell}</td>
+                <td>{session}</td>
+                <td>{val.get("category","")}</td>
+                <td>{val.get("rep","")}</td>
+            """
+            if mode == "supplier_full":
+                cells += f"<td>{opp_cell}</td>"
+
+        else:  # rep view
+            opp_cell = "" if session in ("Power Pairing", "Innovation Theater") else _format_millions(val.get("opportunity", ""))
+
+            cells = f"""
+                <td>{time_cell}</td>
+                <td>TBD</td>
+                <td>{session}</td>
+                <td>{val.get("supplier","")}</td>
+                <td>{opp_cell}</td>
+            """
+
+        html += f"<tr style='background:{bg};'>{cells}</tr>"
         row_idx += 1
 
     return html
 
 
-# =====================================================================
-#   COMMON CSS (Tight alignment across all pages)
-# =====================================================================
+
 COMMON_CSS = """
 @page { margin: 0; }
 
@@ -214,54 +287,72 @@ td {
 # =====================================================================
 def render_supplier_html(supplier_name, booth, schedule_df, supplier_summary, reps_df):
 
-    # ===============================================================
-    # BUILD DAY TABLE MAPPING
-    # ===============================================================
+    has_major_sessions = (
+        schedule_df["session_type"]
+        .fillna("")
+        .str.lower()
+        .isin(["strategy", "planning"])
+        .any()
+    )
+
+    mode = "supplier_full" if has_major_sessions else "supplier_light"
+
+    col_widths = (
+        {"time":"15%","session":"12%","request":"28%","reps":"35%","opp":"10%"}
+        if mode == "supplier_full"
+        else {"time":"15%","session":"20%","request":"28%","reps":"27%"}
+    )
+
     data_map = {
         (r["day"], r["timeslot"]): {
             "rep": ", ".join(r["reps"]) if isinstance(r["reps"], list) else r["reps"],
             "category": r["category"],
-            "opportunity": r.get("total_opportunity", "")
+            "opportunity": r.get("total_opportunity", ""),
+            "session_type": r.get("session_type", ""),
+            "supplier": supplier_name
         }
         for _, r in schedule_df.iterrows()
     }
 
-    days = list(time_slots.keys())
     day_blocks = []
+    for day in time_slots:
+        rows = _build_single_day_rows(day, data_map, supplier_name, mode=mode)
 
-    for day in days:
-        rows = _build_single_day_rows(day, data_map, mode="supplier")
+        headers = f"""
+            <th style="width:{col_widths['time']};">Time</th>
+            <th style="width:{col_widths['session']};">Session</th>
+            <th style="width:{col_widths['request']};">Request</th>
+            <th style="width:{col_widths['reps']};">Appointment With</th>
+        """
+        if mode == "supplier_full":
+            headers += f"<th style='width:{col_widths['opp']};'>Opp. $</th>"
+
         day_blocks.append(f"""
         <div>
             <div class="section-title">{day}</div>
             <table>
-                <tr>
-                    <th style="width:10%;">Time</th>
-                    <th style="width:35%;">Request</th>
-                    <th style="width:45%;">Appointment With</th>
-                    <th style="width:10%;">Opp. $</th>
-                </tr>
+                <tr>{headers}</tr>
                 {rows}
             </table>
         </div>
         """)
 
+    # --------------------------------------------------
+    # Representative Roles Section
+    # --------------------------------------------------
     all_reps = []
     for _, r in schedule_df.iterrows():
-        reps = r["reps"]
-        if isinstance(reps, list):
-            all_reps.extend(reps)
+        if isinstance(r["reps"], list):
+            all_reps.extend(r["reps"])
 
-    all_reps = list(dict.fromkeys(all_reps))  # unique preserve order
+    all_reps = list(dict.fromkeys(all_reps))
 
-    # Build (name, role) tuples
     role_rows = []
     for rep in all_reps:
         match = reps_df[reps_df["Rep Name"] == rep]
-        role = match["Role"].iloc[0] if ("Role" in match and len(match) > 0) else ""
+        role = match["Role"].iloc[0] if len(match) > 0 else ""
         role_rows.append((rep, role))
 
-    # Split evenly between left and right
     half = (len(role_rows) + 1) // 2
     left_rows = role_rows[:half]
     right_rows = role_rows[half:]
@@ -273,47 +364,38 @@ def render_supplier_html(supplier_name, booth, schedule_df, supplier_summary, re
             bg = "#FFFFFF" if idx % 2 == 0 else "#F2F2F2"
             html += f"""
             <tr style="background:{bg}; font-size:11px;">
-                <td style="padding:5px; font-size:10px; width:30%;">{name}</td>
-                <td style="padding:5px; font-size:10px; width:70%;">{role}</td>
+                <td style="padding:5px; width:30%;">{name}</td>
+                <td style="padding:5px; width:70%;">{role}</td>
             </tr>
             """
             idx += 1
         return html
 
-    left_table = build_role_table(left_rows)
-    right_table = build_role_table(right_rows)
-
     roles_html = f"""
-    <div class="section-title" style="margin-top:16px; margin-bottom:4px;">Representative Roles</div>
+    <div class="section-title" style="margin-top:18px;">Representative Roles</div>
 
-    <div class="flex-row" style="margin-top:5px;">
-
+    <div class="flex-row" style="margin-top:4px;">
         <div style="width:48%;">
-            <table style="width:100%; border-collapse:collapse;">
+            <table>
                 <tr>
-                    <th style="width:30%; font-size:12px;">Name</th>
-                    <th style="width:70%; font-size:12px;">Role</th>
+                    <th style="width:30%;">Name</th>
+                    <th style="width:70%;">Role</th>
                 </tr>
-                {left_table}
+                {build_role_table(left_rows)}
             </table>
         </div>
-
         <div style="width:48%;">
-            <table style="width:100%; border-collapse:collapse;">
+            <table>
                 <tr>
-                    <th style="width:30%; font-size:12px;">Name</th>
-                    <th style="width:70%; font-size:12px;">Role</th>
+                    <th style="width:30%;">Name</th>
+                    <th style="width:70%;">Role</th>
                 </tr>
-                {right_table}
+                {build_role_table(right_rows)}
             </table>
         </div>
-
     </div>
     """
 
-    # ===============================================================
-    # NOTE AT BOTTOM
-    # ===============================================================
     note_html = """
     <div class="endnote" style="width:85%; margin:30px auto 10px auto;">
         Representatives may have free slots. For additional availability,
@@ -321,9 +403,6 @@ def render_supplier_html(supplier_name, booth, schedule_df, supplier_summary, re
     </div>
     """
 
-    # ===============================================================
-    # FINAL HTML ASSEMBLY
-    # ===============================================================
     body_days = "".join(day_blocks)
 
     return f"""
@@ -336,7 +415,7 @@ def render_supplier_html(supplier_name, booth, schedule_df, supplier_summary, re
 
     <body>
 
-        <div class="title">2026 Supplier Growth Summit</div>
+        <div class="title">2026 Supplier Growth Forum</div>
         <div class="subtitle">February 23rd – 25th</div>
         <div class="top-info">{supplier_name}</div>
 
@@ -348,6 +427,9 @@ def render_supplier_html(supplier_name, booth, schedule_df, supplier_summary, re
             {body_days}
         </div>
 
+        <div class='page-break'></div>
+        <br><br>
+
         {roles_html}
 
         {note_html}
@@ -355,6 +437,8 @@ def render_supplier_html(supplier_name, booth, schedule_df, supplier_summary, re
     </body>
     </html>
     """
+
+
 
 def render_request_summary_table(supplier_summary):
     requested = supplier_summary.get("requested", [])
@@ -446,6 +530,7 @@ def render_rep_html(rep_name, schedule_df, suppliers_df, reps_df):
             data_map[(r["day"], r["timeslot"])] = {
                 "supplier": supplier,
                 "booth": booth,
+                "session_type": r.get("session_type", ""),
                 "opportunity": r.get("total_opportunity", "")
             }
 
@@ -459,10 +544,11 @@ def render_rep_html(rep_name, schedule_df, suppliers_df, reps_df):
             <div class="section-title">{day}</div>
             <table>
                 <tr>
-                    <th style="width:20%;">Time</th>
-                    <th style="width:20%;">Location</th>
-                    <th style="width:45%;">Supplier</th>
-                    <th style="width:15%;">Opp. $</th>
+                    <th style="width:18%;">Time</th>
+                    <th style="width:18%;">Location</th>
+                    <th style="width:18%;">Session</th>
+                    <th style="width:36%;">Supplier</th>
+                    <th style="width:10%;">Opp. $</th>
                 </tr>
                 {rows}
             </table>
@@ -470,12 +556,6 @@ def render_rep_html(rep_name, schedule_df, suppliers_df, reps_df):
         """)
 
     body_days = "".join(day_blocks)
-
-    note_html = """
-    <div class="endnote" style="width:80%; margin:20px auto;">
-        During available slots, please visit Associate and Program Suppliers.
-    </div>
-    """
 
     return f"""
     <html>
@@ -487,7 +567,7 @@ def render_rep_html(rep_name, schedule_df, suppliers_df, reps_df):
 
     <body>
 
-        <div class="title">2026 Supplier Growth Summit</div>
+        <div class="title">2026 Supplier Growth Forum</div>
         <div class="subtitle">February 23rd – 25th</div>
 
         <div class="top-info">{rep_name}</div>
@@ -501,16 +581,13 @@ def render_rep_html(rep_name, schedule_df, suppliers_df, reps_df):
             {body_days}
         </div>
 
-        {note_html}
-
     </body>
     </html>
     """
 
 
-# =====================================================================
+
 #   Combined HTML for multi-page PDF printing
-# =====================================================================
 import base64
 
 def load_logo_base64(path):
@@ -520,131 +597,252 @@ def load_logo_base64(path):
 
 def render_intro_page(logo_b64: str):
     return f"""
-    <div style="height:10px;"></div>
+    <div style="height:8px;"></div>
 
-    <div style="width:80%; margin:0 auto; display:flex; justify-content:flex-end; padding:8px 0;">
-        <img src="data:image/png;base64,{logo_b64}" style="height:45px;"/>
+    <div style="width:80%; margin:0 auto; display:flex; justify-content:flex-end; padding:6px 0;">
+        <img src="data:image/png;base64,{logo_b64}" style="height:42px;"/>
     </div>
 
     <div style="
         width:80%;
         margin:0 auto;
         background-color:#5533FF;
-        padding:18px;
+        padding:16px;
         border-radius:6px;
         text-align:center;
-        margin-bottom:22px;
+        margin-bottom:18px;
     ">
         <h1 style="color:white; margin:0; font-family:Barlow, sans-serif;">
-            Supplier Growth Summit Schedules
+            Supplier Growth Forum Schedules
         </h1>
     </div>
 
-    <div style="width:80%; margin:0 auto; font-family:Barlow, sans-serif; line-height:1.45;">
+    <div style="width:80%; margin:0 auto; font-family:Barlow, sans-serif; line-height:1.4;">
 
         <!-- ================================================= -->
-        <h2 style="color:#5533FF; font-size:20px;">Scope & Definitions</h2>
+        <h2 style="color:#5533FF; font-size:20px; margin-bottom:6px;">
+            Logic & Assumptions
+        </h2>
 
-        <p style="font-size:14px;">
-            The list of attending Sales Representatives was sourced from the MSC invite list delivered by Leah Bacon on Jan. 6, 2026.
-            Supplier meeting requests come from the Growth Forum Insights Meeting Tracker via SharePoint.
-        </p>
-
-        <p style="font-size:14px; margin-top:10px;">
-            <b>Supplier Requests</b> were standardized to representative names or regions, following these rules:
-        </p>
-
-        <ul style="font-size:14px; margin-left:20px;">
-            <li>Use explicit region or name requests when provided.</li>
-            <li>If a request references a sector or vertical, assign reps most aligned with opportunity.</li>
-            <li>When unclear, assign the region with the greatest modeled opportunity.</li>
-        </ul>
-
-        <!-- ================================================= -->
-        <h2 style="color:#5533FF; font-size:20px; margin-top:20px;">Scheduling Overview</h2>
-
-        <p style="font-size:14px;">
-            Each supplier request is interpreted into the representatives who should attend.  
-            Region-based requests expand into VP, Region, or District Leaders depending on whether the supplier is Peak or Accelerating.
-            Workloads are balanced so no rep exceeds their daily meeting limit. When conflicts occur, substitution logic is applied:
-        </p>
-
-        <ul style="font-size:14px; margin-left:20px;">
-            <li><b>Senior Leaders:</b> replaced with relevant Region or District Leaders.</li>
-            <li><b>Region Leaders:</b> replaced with District Leaders in the same region.</li>
-            <li><b>District Leaders:</b> swapped with another District Leader in the same region.</li>
-            <li>Non-replaceable reps are marked unavailable.</li>
-            <li>See the Supplier Growth Summit Schedules Model Output for a complete record of substitutions.</li>
-        </ul>
-
-        <p style="font-size:14px; margin-top:10px;">
-            Scheduling prioritizes Peak suppliers first, then Accelerating.  
-            Meetings are processed in priority order, and a placement is made only when:
-        </p>
-
-        <ul style="font-size:14px; margin-left:20px;">
-            <li>All assigned representatives are available.</li>
-            <li>The supplier has no existing booking in that timeslot.</li>
+        <ul style="font-size:14px; margin:4px 0 10px 18px;">
+            <li><b>Peak Suppliers</b> – 6 Strategy Sessions &amp; maximum of 12 Planning Sessions</li>
+            <li><b>Accelerating Suppliers</b> – 3 Strategy Sessions &amp; maximum of 18 Planning Sessions</li>
+            <li><b>Rising Suppliers</b> – maximum of 22 Power Pairings</li>
             <li>No representative meets with the same supplier more than once.</li>
         </ul>
 
-        <p style="font-size:14px;">
-            Multiple configurations are evaluated, and the solution
-            with the fewest unscheduled or substituted representatives is selected.
+        <!-- ================================================= -->
+        <h3 style="color:#5533FF; font-size:16px; margin:8px 0 4px 0;">
+            Strategy Sessions
+        </h3>
+
+        <ul style="font-size:14px; margin:2px 0 8px 18px;">
+            <li>Includes District Leaders &amp; Sellers (Regional Directors optional to join at their discretion)</li>
+            <li>Participants assigned based on supplier meeting requests (where provided)</li>
+            <li>60 minutes long</li>
+        </ul>
+
+        <!-- ================================================= -->
+        <h3 style="color:#5533FF; font-size:16px; margin:8px 0 4px 0;">
+            Planning Sessions
+        </h3>
+
+        <ul style="font-size:14px; margin:2px 0 8px 18px;">
+            <li>Includes only Sellers</li>
+            <li>Participants assigned based on districts with highest opportunity per supplier</li>
+            <li>30 minutes long</li>
+        </ul>
+
+        <!-- ================================================= -->
+        <h3 style="color:#5533FF; font-size:16px; margin:8px 0 4px 0;">
+            Power Pairings
+        </h3>
+
+        <ul style="font-size:14px; margin:2px 0 8px 18px;">
+            <li>Includes a single Seller</li>
+            <li>Participants assigned based on districts with highest opportunity per supplier</li>
+            <li>30 minutes long</li>
+        </ul>
+
+        <!-- ================================================= -->
+        <h3 style="color:#5533FF; font-size:16px; margin:8px 0 4px 0;">
+            Opportunity
+        </h3>
+
+        <p style="font-size:14px; margin:2px 0 4px 0;">
+            Assumes the following Close Rates (varies by Product Line):
+        </p>
+
+        <ul style="font-size:14px; margin:2px 0 10px 18px;">
+            <li>Penetration: 5%</li>
+            <li>Acquisition: 1%</li>
+        </ul>
+
+        <p style="font-size:14px; margin:6px 0 12px 0;">
+            List of sales reps attending sourced from Leah Bacon &amp; Casey Ray<br>
+            Sales Team Hierarchy &amp; Roles sourced as is from Steve Huffman &amp; Katie Risolo
         </p>
 
         <!-- ================================================= -->
-        <h2 style="color:#5533FF; font-size:20px; margin-top:20px;">Support</h2>
+        <h2 style="color:#5533FF; font-size:20px; margin:12px 0 6px 0;">
+            Support
+        </h2>
 
-        <p style="font-size:14px;">
-            For questions, contact <b>Precision Business Solutions</b><br>
-            Henrik Elster &lt;helster@precisionmarketdata.com&gt;<br>
-            Kameel Dossal &lt;kdossal@precisionmarketdata.com&gt;
+        <p style="font-size:14px; margin:0;">
+            For questions, contact <b>Precision</b><br>
+            Jesse Katz &lt;jkatz@precisionmarketdata.com&gt;<br>
+            Henrik Elster &lt;helster@precisionmarketdata.com&gt;
         </p>
 
     </div>
     """
 
 
-
-def build_combined_html(html_pages, logo_path="files/logos.png"):
+def render_supplier_toc_page(logo_b64, supplier_names, start_page):
     """
-    Inserts an intro page as the first sheet, then all schedule pages.
+    Builds paginated Table of Contents pages for Supplier schedules.
+    Breaks after 27 rows while preserving layout.
     """
 
-    # Extract shared <head> from the first page
-    first = html_pages[0]
-    head = first.split("<head>")[1].split("</head>")[0]
+    # Build full TOC entries first
+    entries = []
+    for i, name in enumerate(supplier_names):
+        entries.append((name, start_page + i*2))
 
-    # Load logo for intro sheet
-    logo_b64 = load_logo_base64(logo_path)
+    # Logic & Assumptions entry
+    entries.append((
+        "Logic & Assumptions",
+        start_page + len(supplier_names)*2
+    ))
 
-    # Build intro sheet
-    intro_body = render_intro_page(logo_b64)
+    ROWS_PER_PAGE = 27
+    chunks = [
+        entries[i:i + ROWS_PER_PAGE]
+        for i in range(0, len(entries), ROWS_PER_PAGE)
+    ]
 
     pages = []
 
-    # Add intro page as page 1
-    pages.append(f"<div>{intro_body}</div><div class='page-break'></div>")
+    for page_idx, chunk in enumerate(chunks):
 
-    # Add all schedule pages
-    for i, html in enumerate(html_pages):
-        body = html.split("<body>")[1].split("</body>")[0]
-        if i < len(html_pages) - 1:
+        rows_html = ""
+        for name, page_num in chunk:
+            rows_html += f"""
+                <tr>
+                    <td>{name}</td>
+                    <td style="text-align:right;">{page_num}</td>
+                </tr>
+            """
+
+        page_html = f"""
+        <div style="height:10px;"></div>
+
+        <div style="width:80%; margin:0 auto; display:flex; justify-content:flex-end; padding:8px 0;">
+            <img src="data:image/png;base64,{logo_b64}" style="height:45px;"/>
+        </div>
+
+        <div style="
+            width:80%;
+            margin:0 auto;
+            background-color:#5533FF;
+            padding:18px;
+            border-radius:6px;
+            text-align:center;
+            margin-bottom:12px;
+        ">
+            <h1 style="color:white; margin:0; font-family:Barlow, sans-serif;">
+                Supplier Growth Forum Schedules
+            </h1>
+        </div>
+
+        <div class="section-title">
+            Table of Contents
+        </div>
+
+        <div style="width:80%; margin:0 auto;">
+            <table>
+                <tbody>
+                    {rows_html}
+                </tbody>
+            </table>
+        </div>
+        """
+
+        pages.append(page_html)
+
+    # Join pages with hard page breaks
+    return "<div class='page-break'></div>".join(pages)
+
+
+
+
+def build_combined_html(
+    html_pages,
+    logo_path="files/logos.png",
+    mode="Supplier",
+    supplier_names=None
+):
+    """
+    Builds a printable HTML document with:
+    - TOC page
+    - Schedule pages
+    - Logic & Assumptions page (last)
+    """
+
+    first = html_pages[0]
+    head = first.split("<head>")[1].split("</head>")[0]
+
+    logo_b64 = load_logo_base64(logo_path)
+
+    pages = []
+
+    # -----------------------------
+    # SUPPLIER MODE
+    # -----------------------------
+    if mode == "Supplier":
+
+        if supplier_names is None:
+            raise ValueError("supplier_names must be provided for Supplier mode")
+
+        # Page numbers:
+        # 1 = TOC
+        # 2..N = suppliers
+        # last = Logic & Assumptions
+        toc_body = render_supplier_toc_page(
+            logo_b64=logo_b64,
+            supplier_names=supplier_names,
+            start_page=7
+        )
+
+        pages.append(f"<div>{toc_body}</div><div class='page-break'></div>")
+
+        # Supplier pages
+        for html in html_pages:
+            body = html.split("<body>")[1].split("</body>")[0]
             pages.append(f"<div>{body}</div><div class='page-break'></div>")
-        else:
-            pages.append(f"<div>{body}</div>")
+
+        # Logic & Assumptions (last page, no page break)
+        logic_body = render_intro_page(logo_b64)
+        pages.append(f"<div>{logic_body}</div>")
+
+    # -----------------------------
+    # REP MODE (placeholder)
+    # -----------------------------
+    else:
+        # Rep schedule pages
+        for html in html_pages:
+            body = html.split("<body>")[1].split("</body>")[0]
+            pages.append(f"<div>{body}</div><div class='page-break'></div>")
+
+        # Logic & Assumptions (last page, no page break)
+        logic_body = render_intro_page(logo_b64)
+        pages.append(f"<div>{logic_body}</div>")
 
     return f"""
     <html>
-    <head>{head}</head>
-    <body>
-        {''.join(pages)}
-    </body>
+        <head>{head}</head>
+        <body>
+            {''.join(pages)}
+        </body>
     </html>
     """
-
-
-
-def html_to_pdf(html):
-    return html
