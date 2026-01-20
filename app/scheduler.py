@@ -1,722 +1,975 @@
+import re
 import pandas as pd
 import numpy as np
-import random
-from app.utils import time_slots
 from collections import defaultdict
-import copy
-import numpy as np
+import random
+from copy import deepcopy
+from app.utils import time_slots, blocks
 
-######################################################################
-####       STEP 1: CLEANING REGIONAL REQUESTS TO REP NAMES        ####
-######################################################################
-
-# -----------------------------------------
-# Helpers
-# -----------------------------------------
-def is_region_request(att_list):
+def is_district_request(att_list):
+    """
+    District requests always appear as a single token like:
+    K5-6, S4-3, E1-7, etc.
+    """
     if len(att_list) != 1:
         return False
-    x = att_list[0].strip().upper()
-    return x.startswith("KAE") or x.startswith("SAE")
 
-def extract_segment(region_name):
-    return region_name[:3].upper()
+    x = att_list[0].strip().upper()[:4]
+    return bool(re.match(r"^[KSE]\d-\d$", x))
 
-# -----------------------------------------
-# Build region attendee sets
-# -----------------------------------------
-def expand_region_request(att_list, supplier_type, reps_df):
+
+def build_phase1_requested_attendees(preferences, reps_df, sellers_opp_df):
     """
-    Returns a list of candidate DataFrames (one per slot in meeting)
-    each containing the eligible reps.
+    Adds requested_attendees list to each meeting based on:
+
+    - Name-based requests:
+        return names as-is
+
+    - District-based requests:
+        Strategy:
+            - District Leader (if available, one per supplier)
+            - 1 seller spot
+        Planning:
+            - 2 seller spots
+        Power Pairing:
+            - 1 seller spot
+
+    Seller spots are resolved later using district + product_line.
     """
-    region = att_list[0].strip()
-    segment = extract_segment(region)
-
-    region_df = reps_df[reps_df["Region"].str.upper() == region.upper()]
-    seg_df = reps_df[reps_df["Segment"].str.upper() == segment]
-
-    # ideal roles
-    if supplier_type == "Peak":
-        roles = [3, 2]
-    else:
-        roles = [2, 1]
-
-    out = []
-    for w in roles:
-        if w == 3:
-            out.append((3, seg_df[seg_df["Weight"] == 3]))
-        elif w == 2:
-            out.append((2, region_df[region_df["Weight"] == 2]))
-        else:
-            out.append((1, region_df[region_df["Weight"] == 1]))
-    return out
-
-
-def fallback_region(weight, region, segment, reps_df, used):
-    region = region.upper()
-    segment = segment.upper()
-
-    reg_df = reps_df[reps_df["Region"].str.upper() == region]
-    seg_df = reps_df[reps_df["Segment"].str.upper() == segment]
-
-    # remove used
-    reg_df = reg_df[~reg_df["Rep Name"].isin(used)]
-    seg_df = seg_df[~seg_df["Rep Name"].isin(used)]
-
-    if weight == 3:
-        w1 = reg_df[reg_df["Weight"] == 1]
-        if len(w1) >= 2:
-            return w1.sample(2)["Rep Name"].tolist()
-        return []
-
-    if weight == 2:
-        w1 = reg_df[reg_df["Weight"] == 1]
-        if len(w1) >= 1:
-            return [w1.sample(1)["Rep Name"].iloc[0]]
-        return []
-
-    if weight == 1:
-        r1 = reg_df[reg_df["Weight"] == 1]
-        if len(r1) >= 1:
-            return [r1.sample(1)["Rep Name"].iloc[0]]
-        s1 = seg_df[seg_df["Weight"] == 1]
-        if len(s1) >= 1:
-            return [s1.sample(1)["Rep Name"].iloc[0]]
-        return []
-
-    return []
-
-
-def fallback_name(orig_name, reps_df, used):
-    """
-    Simpler: if name is missing or used, we cannot make assumptions.
-    Name fallbacks come later in Phase 2 (during scheduling).
-    For now, just return [] meaning 'no fallback here'.
-    """
-    return []
-
-
-def build_phase1_requested_attendees(preferences, reps_df):
-    """
-    Returns a new preferences dict with 'requested_attendees' added.
-    No scheduling, no timeslots. Only replacing duplicates
-    and producing final clean attendee lists.
-    """
-
-    # ensure no missing strings
-    reps_df["Region"] = reps_df["Region"].fillna("").astype(str)
-    reps_df["Segment"] = reps_df["Segment"].fillna("").astype(str)
 
     new_pref = {}
 
-    for supp, meetings in preferences.items():
-        used = set()
-        out_meetings = []
+    # Build district leader lookup
+    district_leader_map = (
+        reps_df.assign(District=reps_df["District"].str.upper())
+        [["Rep Name", "District"]]
+        .dropna(subset=["District"])
+        .groupby("District")["Rep Name"]
+        .apply(list)
+        .to_dict()
+    )
 
-        for m in sorted(meetings, key=lambda x: x["meeting_number"]):
+    for supplier, meetings in preferences.items():
 
-            supplier_type = m["supplier_type"]
-            atts = m["attendees"]
+        used_leaders_within_supplier = set()
+        updated_meetings = []
 
-            if is_region_request(atts):
-                region = atts[0]
-                segment = extract_segment(region)
+        for m in meetings:
+            raw = m["attendees_raw"]
+            session_type = m["session_type"].strip().lower()
+            pl1 = (m.get("pl1") or "").upper().strip()
 
-                role_list = expand_region_request(atts, supplier_type, reps_df)
+            # -------------------------------
+            # CASE 1: NAME-BASED REQUEST
+            # -------------------------------
+            if not is_district_request(raw):
+                clean_names = list(dict.fromkeys(raw))
 
-                resolved = []
-
-                for w, df_cands in role_list:
-                    # remove already-used
-                    df_cands = df_cands[~df_cands["Rep Name"].isin(used)]
-
-                    if len(df_cands) > 0:
-                        pick = df_cands.sample(1)["Rep Name"].iloc[0]
-                        resolved.append(pick)
-                        used.add(pick)
-                    else:
-                        # fallback
-                        repl = fallback_region(w, region, segment, reps_df, used)
-                        for r in repl:
-                            resolved.append(r)
-                            used.add(r)
-
-                # done
                 m2 = dict(m)
-                m2["requested_attendees"] = resolved
-                out_meetings.append(m2)
+                m2["requested_attendees"] = clean_names
+                updated_meetings.append(m2)
+                continue
+
+            # -------------------------------
+            # CASE 2: DISTRICT-BASED REQUEST
+            # -------------------------------
+            requested_district = raw[0].strip().upper()
+            requested_attendees = []
+
+            # -------------------------------
+            # STRATEGY
+            # -------------------------------
+            if session_type == "strategy":
+
+                leaders = district_leader_map.get(requested_district, [])
+                leader_choice = None
+
+                for L in leaders:
+                    if L not in used_leaders_within_supplier:
+                        leader_choice = L
+                        break
+
+                if leader_choice:
+                    requested_attendees.append(leader_choice)
+                    used_leaders_within_supplier.add(leader_choice)
+
+                requested_attendees.append({
+                    "type": "seller_spot",
+                    "district": requested_district,
+                    "product_line": pl1 if pl1 and pl1 != "NAN" else None,
+                    "count": 1
+                })
+
+            # -------------------------------
+            # PLANNING
+            # -------------------------------
+            elif session_type == "planning":
+
+                requested_attendees.append({
+                    "type": "seller_spot",
+                    "district": requested_district,
+                    "product_line": pl1 if pl1 and pl1 != "NAN" else None,
+                    "count": 2
+                })
+
+            # -------------------------------
+            # POWER PAIRING
+            # -------------------------------
+            elif session_type == "power pairing":
+
+                requested_attendees.append({
+                    "type": "seller_spot",
+                    "district": requested_district,
+                    "product_line": pl1 if pl1 and pl1 != "NAN" else None,
+                    "count": 1
+                })
 
             else:
-                # NAME request
-                resolved = []
-                for name in atts:
-                    # if the rep exists AND unused:
-                    df_match = reps_df[reps_df["Rep Name"].str.upper() == name.upper()]
-                    if len(df_match) > 0:
-                        rep_name = df_match.iloc[0]["Rep Name"]
-                        if rep_name not in used:
-                            resolved.append(rep_name)
-                            used.add(rep_name)
-                        else:
-                            # fallback for duplicate
-                            fb = fallback_name(name, reps_df, used)
-                            resolved.extend(fb)
-                            for f in fb:
-                                used.add(f)
-                    else:
-                        # rep does not exist -- no fallback now
-                        pass
+                raise ValueError(
+                    f"Unknown session_type '{m['session_type']}' "
+                    f"for supplier '{supplier}', meeting #{m['meeting_number']}"
+                )
 
-                m2 = dict(m)
-                m2["requested_attendees"] = resolved
-                out_meetings.append(m2)
+            # Fail-safe
+            if not requested_attendees:
+                raise ValueError(
+                    f"Supplier '{supplier}' meeting #{m['meeting_number']} "
+                    f"could not assign attendees "
+                    f"(session={m['session_type']}, district={requested_district}, pl1={pl1})"
+                )
 
-        new_pref[supp] = out_meetings
+            m2 = dict(m)
+            m2["requested_attendees"] = requested_attendees
+            updated_meetings.append(m2)
+
+        new_pref[supplier] = updated_meetings
 
     return new_pref
 
-
-######################################################################
-####  STEP 2: IMPLEMENTING GLOBAL UPPER BOUND FOR MAX MEETINGS    ####
-######################################################################
-
-
-def get_weight(rep_name, reps_df):
-    row = reps_df[reps_df["Rep Name"] == rep_name]
-    if len(row) == 0:
-        return None
-    return int(row.iloc[0]["Weight"])
-
-
-def get_region_segment(rep_name, reps_df):
-    row = reps_df[reps_df["Rep Name"] == rep_name]
-    if len(row) == 0:
-        return None, None
-    region = row.iloc[0]["Region"]
-    segment = row.iloc[0]["Segment"]
-    return region, segment
-
-
-def find_replacement(rep_name, rep_weight, reps_df, used_reps, target_region, target_segment):
-
-    df = reps_df[~reps_df["Rep Name"].isin(used_reps)]
-
-    # W3 → W1 same segment
-    if rep_weight == 3:
-        seg_df = df[df["Segment"].str.upper() == target_segment.upper()]
-        w1 = seg_df[seg_df["Weight"] == 1]
-        if len(w1) > 0:
-            return w1.sample(1)["Rep Name"].iloc[0]
-        return None
-
-    # W2 → W1 same region
-    if rep_weight == 2:
-        reg_df = df[df["Region"].str.upper() == target_region.upper()]
-        w1 = reg_df[reg_df["Weight"] == 1]
-        if len(w1) > 0:
-            return w1.sample(1)["Rep Name"].iloc[0]
-        return None
-
-    # W1 → W1 same region
-    if rep_weight == 1:
-        reg_df = df[df["Region"].str.upper() == target_region.upper()]
-        w1 = reg_df[reg_df["Weight"] == 1]
-        if len(w1) > 0:
-            return w1.sample(1)["Rep Name"].iloc[0]
-        return None
-
-    return None
-
-
-def build_phase2_cleaned_requests(preferences, reps_df, max_meetings_rep=12):
+def build_phase2_strategy_sessions(
+    phase1,
+    reps_df,
+    sellers_opp_df,
+    supplier_busy,
+    rep_busy,
+    supplier_rows,
+    rep_rows,
+    sup_summary,
+    rng
+):
     """
-    Input:
-        preferences = raw preferences
-        reps_df = sales rep table
-        max_meetings_rep = global upper bound
-    Output:
-        cleaned preferences
-        rep load summary dict
+    Schedule ONLY Strategy sessions using:
+      supplier + leader (if any) + seller
+    Sellers are tried by opportunity.
+    Time windows are tried in RANDOMIZED order per meeting.
     """
 
-    preferences_phase1 = build_phase1_requested_attendees(preferences, reps_df)
-
-    rep_counts = defaultdict(int)
-    for supp, meetings in preferences_phase1.items():
-        for m in meetings:
-            for rep in m["requested_attendees"]:
-                rep_counts[rep] += 1
-
-    starting_counts = dict(rep_counts)
-
-    suppliers_sorted = []
-
-    for supp, meetings in preferences_phase1.items():
-        supplier_type = meetings[0]["supplier_type"]
-        is_acc = 0 if supplier_type == "Accelerating" else 1
-        highest_meeting = max(m["meeting_number"] for m in meetings)
-        suppliers_sorted.append((is_acc, highest_meeting, supp))
-
-    suppliers_sorted = sorted(suppliers_sorted, key=lambda x: (x[0], -x[1]))
-
-    cleaned = {supp: [dict(m) for m in meetings] for supp, meetings in preferences_phase1.items()}
-
-    # Core load reduction loop
-    for _, _, supp in suppliers_sorted:
-
-        meetings = cleaned[supp]
-
-        for m in sorted(meetings, key=lambda x: -x["meeting_number"]):
-
-            new_list = []
-            used = set()
-
-            for rep in m["requested_attendees"]:
-
-                if rep_counts[rep] <= max_meetings_rep:
-                    new_list.append(rep)
-                    used.add(rep)
+    def all_strategy_windows():
+        windows = []
+        for day, slots in time_slots.items():
+            slot_list = list(slots.keys())
+            for i in range(len(slot_list) - 1):
+                s1, s2 = slot_list[i], slot_list[i + 1]
+                if slots[s1] == "LUNCH" or slots[s2] == "LUNCH":
                     continue
+                windows.append((day, s1, s2))
+        return windows
 
-                rep_w = get_weight(rep, reps_df)
-                reg, seg = get_region_segment(rep, reps_df)
+    base_windows = all_strategy_windows()
 
-                replacement = None
+    for supplier, meetings in phase1.items():
 
-                if rep_w is not None:
-                    replacement = find_replacement(rep, rep_w, reps_df, used, reg, seg)
-
-                rep_counts[rep] -= 1
-                if rep_counts[rep] < 0:
-                    rep_counts[rep] = 0
-
-                if replacement is not None:
-                    new_list.append(replacement)
-                    used.add(replacement)
-                    rep_counts[replacement] += 1
-
-            m["requested_attendees"] = new_list
-
-    # manual override
-    cleaned['Simple Green'][0]['requested_attendees'] = ['Matthew Borich', 'William Hollenbach III', 'Dawn Cormier']
-    cleaned['Brady'][0]['requested_attendees'] = ['Tom Birchard', 'Ali Mccraw', 'Clayton Davis']
-
-    # Mark unavailable reps in NAME requests
-    for supp, meetings in cleaned.items():
         for m in meetings:
-
-            # skip region requests
-            if len(m["attendees"]) == 1 and (
-                m["attendees"][0].strip().upper().startswith("KAE")
-                or m["attendees"][0].strip().upper().startswith("SAE")
-            ):
+            if m["session_type"] != "Strategy":
                 continue
-
-            original = set(a.strip() for a in m["attendees"])
-            final = set(a.strip() for a in m["requested_attendees"])
-
-            missing = sorted(list(original - final))
-            m["unavailable"] = missing
-
-    # Summary
-    rep_load_summary = {
-        "start_counts": starting_counts,
-        "final_counts": dict(rep_counts)
-    }
-
-    return cleaned, rep_load_summary
-
-######################################################################
-####              STEP 3: SCHEDULER AND VALIDATION                ####
-######################################################################
-
-def build_validation_report(cleaned_prefs, supplier_schedule, reps_schedule, sup_summary):
-    """
-    Build analytical report of failures, grouped by total, by type, and by supplier.
-    """
-
-    report = {
-        "total_failed": 0,
-        "failed_by_type": {"Peak": 0, "Accelerating": 0},
-        "failed_by_supplier": {},
-        "failed_meetings_detail": []
-    }
-
-    # Loop each supplier’s summary
-    for supp, summary in sup_summary.items():
-
-        requested = summary["requested"]
-        fulfilled = summary["fulfilled"]
-        failed = [r for r in requested if r not in fulfilled]
-
-        supplier_type = cleaned_prefs[supp][0]["supplier_type"]
-
-        # Init supplier block
-        report["failed_by_supplier"][supp] = {
-            "supplier_type": supplier_type,
-            "requested": len(requested),
-            "fulfilled": len(fulfilled),
-            "failed": len(failed)
-        }
-
-        # Update totals
-        report["total_failed"] += len(failed)
-        report["failed_by_type"][supplier_type] += len(failed)
-
-        # Build detail for each failed meeting
-        for req_name in failed:
-            # find the Phase 2 request block
-            req_block = next((r for r in cleaned_prefs[supp] if r["request_name"] == req_name), None)
-
-            if req_block is None:
-                continue
-
-            requested_attendees = req_block["requested_attendees"]
-            substitutions = sup_summary[supp]["substitutions"].get(req_name, [])
-
-            # pull rep schedules for these reps
-            rep_scheds = {}
-            for rep in requested_attendees:
-                rep_scheds[rep] = reps_schedule[reps_schedule["rep"] == rep].copy()
-
-            report["failed_meetings_detail"].append({
-                "supplier": supp,
-                "supplier_type": supplier_type,
-                "request_name": req_name,
-                "requested_attendees": requested_attendees,
-                "substitutions": substitutions,
-                "rep_schedules": rep_scheds
-            })
-
-    return report
-
-
-def shuffle_timeslots(supplier_df, reps_df, seed=42):
-    """
-    Shuffle ALL timeslots globally while keeping the meeting assignments identical.
-
-    Example:
-        Tuesday 8am  -> Wednesday 10am
-        Tuesday 9am  -> Tuesday 3pm
-        etc.
-
-    This is a bijection mapping (one-to-one).
-    """
-
-    # ----------------------------------------------------
-    # 1. Collect all valid timeslots
-    # ----------------------------------------------------
-    all_slots = []
-    for day, mapping in time_slots.items():
-        for slot, state in mapping.items():
-            if state not in ("LUNCH", "BREAK"):
-                all_slots.append((day, slot))
-
-    # Safety
-    if len(all_slots) == 0:
-        return supplier_df, reps_df
-
-    # ----------------------------------------------------
-    # 2. Shuffle timeslots
-    # ----------------------------------------------------
-    rng = np.random.default_rng(seed)
-    shuffled = all_slots.copy()
-    rng.shuffle(shuffled)
-
-    # Build mapping dict
-    remap = {old: new for old, new in zip(all_slots, shuffled)}
-
-    # ----------------------------------------------------
-    # 3. Apply mapping to supplier schedule
-    # ----------------------------------------------------
-    supplier_df = supplier_df.copy()
-    supplier_df["day_new"] = supplier_df.apply(
-        lambda r: remap[(r["day"], r["timeslot"])][0],
-        axis=1
-    )
-    supplier_df["timeslot_new"] = supplier_df.apply(
-        lambda r: remap[(r["day"], r["timeslot"])][1],
-        axis=1
-    )
-    supplier_df.drop(columns=["day", "timeslot"], inplace=True)
-    supplier_df.rename(columns={"day_new": "day", "timeslot_new": "timeslot"}, inplace=True)
-
-    # ----------------------------------------------------
-    # 4. Apply mapping to rep schedule
-    # ----------------------------------------------------
-    reps_df = reps_df.copy()
-    reps_df["day_new"] = reps_df.apply(
-        lambda r: remap[(r["day"], r["timeslot"])][0],
-        axis=1
-    )
-    reps_df["timeslot_new"] = reps_df.apply(
-        lambda r: remap[(r["day"], r["timeslot"])][1],
-        axis=1
-    )
-    reps_df.drop(columns=["day", "timeslot"], inplace=True)
-    reps_df.rename(columns={"day_new": "day", "timeslot_new": "timeslot"}, inplace=True)
-
-    return supplier_df, reps_df
-
-def build_phase3_create_schedules(preferences,
-                                  reps_df,
-                                  max_meetings_rep=12,
-                                  max_peak=6,
-                                  max_acc=3,
-                                  seed=42):
-
-    """
-    Phase 3: Use Phase 2 cleaned attendee lists and attempt to schedule all meetings,
-    then shuffle timeslots globally.
-    """
-
-    # ------------------------------------------------------
-    # Step 1: Run Phase 2 preprocessing
-    # ------------------------------------------------------
-    cleaned_prefs, rep_summary = build_phase2_cleaned_requests(
-        preferences, reps_df, max_meetings_rep
-    )
-
-    # ------------------------------------------------------
-    # Step 2: Track rep availability
-    # ------------------------------------------------------
-    rep_avail = {
-        rep: {
-            day: {slot: (state is None) for slot, state in time_slots[day].items()}
-            for day in time_slots
-        }
-        for rep in reps_df["Rep Name"]
-    }
-
-    rep_meet_count = {rep: 0 for rep in reps_df["Rep Name"]}
-
-    supplier_rows = []
-    rep_rows = []
-    sup_summary = {}
-
-    # ------------------------------------------------------
-    # Step 3: Supplier scheduling order
-    # ------------------------------------------------------
-    suppliers = list(cleaned_prefs.keys())
-
-    def sort_key(supp):
-        t = cleaned_prefs[supp][0]["supplier_type"]
-        return 0 if t == "Peak" else 1
-
-    suppliers = sorted(suppliers, key=sort_key)
-
-    # ------------------------------------------------------
-    # Step 4: All usable timeslots
-    # ------------------------------------------------------
-    def all_slots():
-        out = []
-        for day, mapping in time_slots.items():
-            for slot, state in mapping.items():
-                if state not in ("LUNCH", "BREAK"):
-                    out.append((day, slot))
-        return out
-
-    slot_order = all_slots()
-
-    random.seed(seed)
-    np.random.seed(seed)
-
-    # ------------------------------------------------------
-    # Step 5: Scheduling loop
-    # ------------------------------------------------------
-    for supp in suppliers:
-
-        meetings = cleaned_prefs[supp]
-        supplier_type = meetings[0]["supplier_type"]
-        booth = meetings[0]["booth"]
-
-        cap = max_peak if supplier_type == "Peak" else max_acc
-
-        sup_summary[supp] = {
-            "requested": [],
-            "fulfilled": [],
-            "substitutions": {},
-            "req_types": {},
-        }
-
-        used_count = 0
-
-        for m in sorted(meetings, key=lambda x: x["meeting_number"]):
 
             req_name = m["request_name"]
-            attendees = m["requested_attendees"]
-            tot_opp = m.get("total_opportunity", 0.0)
-            type = m["request_type"]
+            booth = m["booth"]
+            tot_opp = m["total_opportunity"]
 
-            sup_summary[supp]["requested"].append(req_name)
+            requested = m["requested_attendees"]
 
-            if used_count >= cap:
-                break
+            leaders = [a for a in requested if isinstance(a, str)]
+            seller_spots = [a for a in requested if isinstance(a, dict)]
 
-            assigned = False
+            # Randomize time windows per meeting
+            windows = base_windows.copy()
+            rng.shuffle(windows)
 
-            for day, slot in slot_order:
+            # --------------------------------------------------
+            # CASE 1: Name-based Strategy (no seller spots)
+            # --------------------------------------------------
+            if not seller_spots:
+                required_reps = leaders
+                booked = False
 
-                supplier_double = any(
-                    r["supplier"] == supp and r["day"] == day and r["timeslot"] == slot
-                    for r in supplier_rows
-                )
-                if supplier_double:
+                for day, s1, s2 in windows:
+                    if supplier_busy[supplier][day][s1] or supplier_busy[supplier][day][s2]:
+                        continue
+                    if any(rep_busy[r][day][s1] or rep_busy[r][day][s2] for r in required_reps):
+                        continue
+
+                    _book_strategy(
+                        supplier, required_reps, day, s1, s2,
+                        booth, req_name, tot_opp,
+                        supplier_busy, rep_busy, supplier_rows, rep_rows
+                    )
+
+                    sup_summary[supplier]["fulfilled"].append(req_name)
+                    booked = True
+                    break
+
+                if not booked:
+                    sup_summary[supplier]["unfulfilled"].append(req_name)
+
+                continue
+
+            # --------------------------------------------------
+            # CASE 2: District-based Strategy (leader + seller)
+            # --------------------------------------------------
+            spot = seller_spots[0]
+            district = spot["district"].upper().strip()
+            product_line = spot.get("product_line")
+
+            candidates = sellers_opp_df[
+                sellers_opp_df["district"].str.upper() == district
+            ]
+
+            if product_line:
+                candidates = candidates[
+                    candidates["product_line"] == product_line.upper().strip()
+                ]
+
+            candidates = candidates.sort_values("opportunity", ascending=False)
+
+            booked = False
+
+            for _, row in candidates.iterrows():
+                seller = row["name"]
+                required_reps = leaders + [seller]
+
+                for day, s1, s2 in windows:
+                    if supplier_busy[supplier][day][s1] or supplier_busy[supplier][day][s2]:
+                        continue
+                    if any(rep_busy[r][day][s1] or rep_busy[r][day][s2] for r in required_reps):
+                        continue
+
+                    _book_strategy(
+                        supplier, required_reps, day, s1, s2,
+                        booth, req_name, tot_opp,
+                        supplier_busy, rep_busy, supplier_rows, rep_rows
+                    )
+
+                    sup_summary[supplier]["fulfilled"].append(req_name)
+                    booked = True
+                    break
+
+                if booked:
+                    break
+
+            if not booked:
+                sup_summary[supplier]["unfulfilled"].append(req_name)
+
+def _book_strategy(
+    supplier, reps, day, s1, s2,
+    booth, req_name, tot_opp,
+    supplier_busy, rep_busy, supplier_rows, rep_rows
+):
+    supplier_busy[supplier][day][s1] = True
+    supplier_busy[supplier][day][s2] = True
+
+    for r in reps:
+        rep_busy[r][day][s1] = True
+        rep_busy[r][day][s2] = True
+
+    for slot in (s1, s2):
+        supplier_rows.append({
+            "supplier": supplier,
+            "booth": booth,
+            "day": day,
+            "timeslot": slot,
+            "session_type": "Strategy",
+            "reps": reps,
+            "category": req_name,
+            "total_opportunity": tot_opp
+        })
+
+        for r in reps:
+            rep_rows.append({
+                "rep": r,
+                "day": day,
+                "timeslot": slot,
+                "supplier": supplier,
+                "booth": booth,
+                "session_type": "Strategy",
+                "category": req_name,
+                "total_opportunity": tot_opp
+            })
+
+def build_phase2_planning_sessions(
+    phase1,
+    sellers_opp_df,
+    supplier_busy,
+    rep_busy,
+    supplier_rows,
+    rep_rows,
+    sup_summary,
+    rng
+):
+    """
+    Schedule ONLY Planning sessions using:
+      supplier + 2 sellers
+    Sellers are chosen by opportunity.
+    Time slots are tried in RANDOMIZED order per meeting.
+    """
+
+    def all_planning_slots():
+        slots_out = []
+        for day, slots in time_slots.items():
+            for s in slots.keys():
+                if slots[s] == "LUNCH":
                     continue
+                slots_out.append((day, s))
+        return slots_out
 
-                available = True
-                for rep in attendees:
-                    if rep_meet_count[rep] >= max_meetings_rep:
-                        available = False
+    base_slots = all_planning_slots()
+
+    for supplier, meetings in phase1.items():
+
+        for m in meetings:
+            if m["session_type"] != "Planning":
+                continue
+
+            req_name = m["request_name"]
+            booth = m["booth"]
+            tot_opp = m["total_opportunity"]
+
+            requested = m["requested_attendees"]
+            spot = requested[0]  # Planning always has one seller_spot
+
+            district = spot["district"].upper().strip()
+            product_line = spot.get("product_line")
+            count_needed = spot.get("count", 2)
+
+            # Candidate sellers ordered by opportunity
+            candidates = sellers_opp_df[
+                sellers_opp_df["district"].str.upper() == district
+            ]
+
+            if product_line:
+                candidates = candidates[
+                    candidates["product_line"] == product_line.upper().strip()
+                ]
+
+            candidates = candidates.sort_values("opportunity", ascending=False)
+            seller_list = candidates["name"].tolist()
+
+            booked = False
+
+            # Randomize slots per meeting
+            slots = base_slots.copy()
+            rng.shuffle(slots)
+
+            # Try all seller pairs in priority order
+            for i in range(len(seller_list)):
+                for j in range(i + 1, len(seller_list)):
+                    sellers = [seller_list[i], seller_list[j]]
+
+                    if len(sellers) < count_needed:
+                        continue
+
+                    for day, s in slots:
+                        if supplier_busy[supplier][day][s]:
+                            continue
+                        if any(rep_busy[r][day][s] for r in sellers):
+                            continue
+
+                        _book_planning(
+                            supplier, sellers, day, s,
+                            booth, req_name, tot_opp,
+                            supplier_busy, rep_busy,
+                            supplier_rows, rep_rows
+                        )
+
+                        sup_summary[supplier]["fulfilled"].append(req_name)
+                        booked = True
                         break
-                    if not rep_avail[rep][day][slot]:
-                        available = False
+
+                    if booked:
                         break
-                if not available:
-                    continue
+                if booked:
+                    break
 
-                # Assign meeting
-                assigned = True
-                used_count += 1
-                sup_summary[supp]["fulfilled"].append(req_name)
+            if not booked:
+                sup_summary[supplier]["unfulfilled"].append(req_name)
 
-                # Missing names → substitutions
-                subs = m["unavailable"] if "unavailable" in m else []
-                sup_summary[supp]["substitutions"][req_name] = subs
-                sup_summary[supp]["req_types"][req_name] = type
+def _book_planning(
+    supplier, reps, day, s,
+    booth, req_name, tot_opp,
+    supplier_busy, rep_busy,
+    supplier_rows, rep_rows
+):
+    supplier_busy[supplier][day][s] = True
 
-                # --------------------------
-                # Write Supplier schedule row
-                # --------------------------
-                supplier_rows.append({
-                    "supplier": supp,
-                    "booth": booth,
+    for r in reps:
+        rep_busy[r][day][s] = True
+
+    supplier_rows.append({
+        "supplier": supplier,
+        "booth": booth,
+        "day": day,
+        "timeslot": s,
+        "session_type": "Planning",
+        "reps": reps,
+        "category": req_name,
+        "total_opportunity": tot_opp
+    })
+
+    for r in reps:
+        rep_rows.append({
+            "rep": r,
+            "day": day,
+            "timeslot": s,
+            "supplier": supplier,
+            "booth": booth,
+            "session_type": "Planning",
+            "category": req_name,
+            "total_opportunity": tot_opp
+        })
+
+
+def get_innovation_workers(reps_df):
+    """
+    EDIT HERE if worker definition changes.
+    """
+    return reps_df[reps_df["Seller"]=="Y"]["Rep Name"].tolist()
+
+def build_innovation_sessions_from_blocks():
+    """
+    Build innovation sessions ONCE.
+    Each session has a hard capacity of 100 total reps.
+    """
+
+    sessions = []
+
+    for day, slot_map in blocks.items():
+        slots = list(slot_map.keys())
+        i = 0
+
+        while i < len(slots):
+            slot = slots[i]
+            suppliers = slot_map[slot]
+
+            if not suppliers:
+                i += 1
+                continue
+
+            supplier = suppliers[0]
+            session_slots = [slot]
+
+            # Merge consecutive slots for same supplier
+            if i + 1 < len(slots) and slot_map[slots[i + 1]] == suppliers:
+                session_slots.append(slots[i + 1])
+                i += 1
+
+            sessions.append({
+                "supplier": supplier,
+                "day": day,
+                "slots": session_slots,
+                "assigned": set(),     # IMPORTANT: set, not list
+                "capacity": 85
+            })
+
+            i += 1
+
+    return sessions
+
+
+
+def assign_minimum_innovation_sessions(
+    reps_df,
+    innovation_sessions,
+    rep_busy,
+    rep_rows,
+    rng
+):
+    """
+    Assign exactly 1 Innovation Theater session per worker first,
+    spreading reps evenly across sessions in round-robin order.
+    """
+
+    workers = get_innovation_workers(reps_df)
+
+    # Randomize order to avoid bias
+    rng.shuffle(workers)
+    rng.shuffle(innovation_sessions)
+
+    num_sessions = len(innovation_sessions)
+    session_idx = 0
+
+    for rep in workers:
+        tried = 0
+        assigned = False
+
+        # Try sessions in round-robin order
+        while tried < num_sessions:
+            session = innovation_sessions[session_idx]
+            session_idx = (session_idx + 1) % num_sessions
+            tried += 1
+
+            # Capacity check
+            if len(session["assigned"]) >= session["capacity"]:
+                continue
+
+            day = session["day"]
+            slots = session["slots"]
+
+            # Availability check
+            if any(rep_busy[rep][day].get(s, False) for s in slots):
+                continue
+
+            # Assign rep
+            session["assigned"].add(rep)
+
+            for s in slots:
+                rep_busy[rep][day][s] = True
+                rep_rows.append({
+                    "rep": rep,
                     "day": day,
-                    "timeslot": slot,
-                    "reps": attendees,
-                    "category": req_name,
-                    "total_opportunity": tot_opp
+                    "timeslot": s,
+                    "supplier": session["supplier"],
+                    "booth": "",
+                    "session_type": "Innovation Theater",
+                    "category": "",
+                    "total_opportunity": ""
                 })
 
-                # --------------------------
-                # Write Rep schedule rows
-                # --------------------------
-                for rep in attendees:
+            assigned = True
+            break
+
+        if not assigned:
+            print(f"WARNING: {rep} received no Innovation session")
+
+
+def fill_innovation_sessions_to_capacity(
+    reps_df,
+    innovation_sessions,
+    rep_busy,
+    rep_rows,
+    rng
+):
+    workers = get_innovation_workers(reps_df)
+
+    worker_counts = {
+        r: sum(
+            1 for row in rep_rows
+            if row["rep"] == r and row["session_type"] == "Innovation Theater"
+        )
+        for r in workers
+    }
+
+    round_num = 1
+
+    while True:
+        progress = False
+
+        for session in innovation_sessions:
+            if len(session["assigned"]) >= session["capacity"]:
+                continue
+
+            day = session["day"]
+            slots = session["slots"]
+
+            for rep in workers:
+                if len(session["assigned"]) >= session["capacity"]:
+                    break
+
+                if worker_counts[rep] > round_num:
+                    continue
+
+                if rep in session["assigned"]:
+                    continue
+
+                if any(rep_busy[rep][day].get(s, False) for s in slots):
+                    continue
+
+                session["assigned"].add(rep)
+                worker_counts[rep] += 1
+                progress = True
+
+                for s in slots:
+                    rep_busy[rep][day][s] = True
                     rep_rows.append({
                         "rep": rep,
                         "day": day,
-                        "timeslot": slot,
-                        "supplier": supp,
-                        "booth": booth,
-                        "category": req_name,
-                        "total_opportunity": tot_opp
+                        "timeslot": s,
+                        "supplier": session["supplier"],
+                        "booth": "",
+                        "session_type": "Innovation Theater",
+                        "category": "",
+                        "total_opportunity": ""
                     })
 
-                    rep_avail[rep][day][slot] = False
-                    rep_meet_count[rep] += 1
+        if not progress:
+            break
 
-                break  # stop searching for slots
+        round_num += 1
 
-            if not assigned:
-                sup_summary[supp]["substitutions"][req_name] = \
-                    m["unavailable"] if "unavailable" in m else []
 
-        if cap > 0:
-            new_requested = []
-            fulfilled_count = 0
 
-            for req in sup_summary[supp]["requested"]:
-                new_requested.append(req)
 
-                if req in sup_summary[supp]["fulfilled"]:
-                    fulfilled_count += 1
-
-                # stop as soon as we have shown *cap* fulfilled meetings
-                if fulfilled_count >= cap:
-                    break
-
-            sup_summary[supp]["requested"] = new_requested
-
-    # Convert to DataFrames (now with opportunity values)
-    supplier_df = pd.DataFrame(supplier_rows)
-    reps_df_sched = pd.DataFrame(rep_rows)
-
-    # ------------------------------------------------------
-    # Shuffle timeslots globally
-    # ------------------------------------------------------
-    supplier_df, reps_df_sched = shuffle_timeslots(
-        supplier_df, reps_df_sched, seed=seed
-    )
-
-    # ------------------------------------------------------
-    # Final validation
-    # ------------------------------------------------------
-    validation = build_validation_report(
-        cleaned_prefs, supplier_df, reps_df_sched, sup_summary
-    )
-
-    return supplier_df, reps_df_sched, sup_summary, validation
-
-######################################################################
-####                  STEP 4: RUN SCHEDULER                       ####
-######################################################################
-
-def run_scheduler(preferences,
-                  reps_df,
-                  max_meetings_rep=12,
-                  max_peak=6,
-                  max_acc=3,
-                  seeds=100):
+def build_phase2_power_pairings(
+    phase1,
+    sellers_opp_df,
+    supplier_busy,
+    rep_busy,
+    supplier_rows,
+    rep_rows,
+    sup_summary,
+    rng
+):
     """
-    Runs Phase 3 scheduling across many seeds and returns the result
-    from the best-performing seed (least total failures).
+    Book Power Pairing sessions:
+    - Supplier + 1 seller
+    - Seller chosen by district + PL, ordered by opportunity
+    - Slot chosen randomly from all valid options
+
+    HARD CONSTRAINT:
+    - No Power Pairings on Tuesday, February 24th at 11:00 AM or 11:30 AM
     """
 
-    results = []
-    best_output = None
+    # -------------------------------------------------
+    # Hard-coded blocked window for Power Pairings
+    # -------------------------------------------------
+    BLOCKED_PP_DAY = "Tuesday, February 24th"
+    BLOCKED_PP_SLOTS = {"11:00 AM", "11:30 AM"}
 
-    for s in range(seeds):
+    # Collect all Power Pairing meetings
+    meetings = []
+    for supplier, ms in phase1.items():
+        for m in ms:
+            if m["session_type"].strip().lower() == "power pairing":
+                meetings.append(m)
 
-        supplier_schedule, reps_schedule, sup_summary, validation = \
-            build_phase3_create_schedules(
-                preferences,
-                reps_df,
-                max_meetings_rep=max_meetings_rep,
-                max_peak=max_peak,
-                max_acc=max_acc,
-                seed=s
-            )
+    # Highest opportunity first
+    meetings.sort(key=lambda m: m["total_opportunity"], reverse=True)
 
-        fail_peak = validation["failed_by_type"]["Peak"]
-        fail_acc = validation["failed_by_type"]["Accelerating"]
-        fail_total = fail_peak + fail_acc
+    for m in meetings:
+        supplier = m["supplier_name"]
+        booth = m["booth"]
+        req_name = m["request_name"]
+        tot_opp = m["total_opportunity"]
 
-        results.append({
-            "seed": s,
-            "fail_peak": fail_peak,
-            "fail_acc": fail_acc,
-            "fail_total": fail_total
+        seller_spot = next(
+            a for a in m["requested_attendees"]
+            if isinstance(a, dict) and a.get("type") == "seller_spot"
+        )
+
+        district = seller_spot["district"].upper().strip()
+        product_line = seller_spot.get("product_line")
+
+        # Candidate sellers
+        sellers = sellers_opp_df[
+            sellers_opp_df["district"].str.upper() == district
+        ]
+
+        if product_line:
+            sellers = sellers[
+                sellers["product_line"].str.upper() == product_line.upper()
+            ]
+
+        sellers = sellers.sort_values("opportunity", ascending=False)
+
+        booked = False
+
+        for _, row in sellers.iterrows():
+            seller = row["name"]
+
+            valid_slots = []
+
+            for day, slots in time_slots.items():
+                for slot, label in slots.items():
+
+                    # Skip lunch
+                    if label == "LUNCH":
+                        continue
+
+                    # Skip Power Pairing blocked window
+                    if (
+                        day == BLOCKED_PP_DAY
+                        and slot in BLOCKED_PP_SLOTS
+                    ):
+                        continue
+
+                    if supplier_busy[supplier][day][slot]:
+                        continue
+
+                    if rep_busy[seller][day][slot]:
+                        continue
+
+                    valid_slots.append((day, slot))
+
+            if not valid_slots:
+                continue
+
+            day, slot = rng.choice(valid_slots)
+
+            # Mark busy
+            supplier_busy[supplier][day][slot] = True
+            rep_busy[seller][day][slot] = True
+
+            supplier_rows.append({
+                "supplier": supplier,
+                "booth": booth,
+                "day": day,
+                "timeslot": slot,
+                "session_type": "Power Pairing",
+                "reps": [seller],
+                "category": req_name,
+                "total_opportunity": tot_opp
+            })
+
+            rep_rows.append({
+                "rep": seller,
+                "day": day,
+                "timeslot": slot,
+                "supplier": supplier,
+                "booth": booth,
+                "session_type": "Power Pairing",
+                "category": req_name,
+                "total_opportunity": tot_opp
+            })
+
+            sup_summary[supplier]["fulfilled"].append(req_name)
+            booked = True
+            break
+
+        if not booked:
+            sup_summary[supplier]["unfulfilled"].append(req_name)
+
+
+def build_phase3_core_scheduler(preferences, reps_df, sellers_opp_df, seed):
+    rng = random.Random(seed)
+
+    phase1 = build_phase1_requested_attendees(preferences, reps_df, sellers_opp_df)
+
+    supplier_rows = []
+    rep_rows = []
+
+    supplier_busy = {
+        s: {d: {t: False for t in time_slots[d]} for d in time_slots}
+        for s in preferences.keys()
+    }
+
+    rep_busy = {
+        r: {d: {t: False for t in time_slots[d]} for d in time_slots}
+        for r in reps_df["Rep Name"].tolist()
+    }
+
+    for day, blk in blocks.items():
+        for slot, blocked in blk.items():
+            for s in blocked:
+                if s in supplier_busy:
+                    supplier_busy[s][day][slot] = True
+
+    sup_summary = {
+        s: {
+            "requested": [m["request_name"] for m in meetings],
+            "fulfilled": [],
+            "unfulfilled": [],
+            "unfulfilled_power_pairings": []
+        }
+        for s, meetings in phase1.items()
+    }
+
+    # 🔹 Build innovation sessions ONCE
+    innovation_sessions = build_innovation_sessions_from_blocks()
+
+    # 🔹 Pass A: guarantee 1 per worker
+    assign_minimum_innovation_sessions(
+        reps_df,
+        innovation_sessions,
+        rep_busy,
+        rep_rows,
+        rng
+    )
+
+    # Strategy
+    build_phase2_strategy_sessions(
+        phase1, reps_df, sellers_opp_df,
+        supplier_busy, rep_busy,
+        supplier_rows, rep_rows,
+        sup_summary, rng
+    )
+
+    # Planning
+    build_phase2_planning_sessions(
+        phase1, sellers_opp_df,
+        supplier_busy, rep_busy,
+        supplier_rows, rep_rows,
+        sup_summary, rng
+    )
+
+    validation = {
+        "total_unfulfilled": sum(len(v["unfulfilled"]) for v in sup_summary.values()),
+        "unfulfilled_detail": {
+            s: v["unfulfilled"]
+            for s, v in sup_summary.items()
+            if v["unfulfilled"]
+        }
+    }
+
+    return {
+        "seed": seed,
+        "phase1": phase1,
+        "supplier_rows": supplier_rows,
+        "rep_rows": rep_rows,
+        "supplier_busy": supplier_busy,
+        "rep_busy": rep_busy,
+        "innovation_sessions": innovation_sessions,
+        "summary": sup_summary,
+        "validation": validation
+    }
+
+
+
+def extend_with_addons(core_result, reps_df, sellers_opp_df, seed):
+    rng = random.Random(seed)
+
+    supplier_rows = list(core_result["supplier_rows"])
+    rep_rows = list(core_result["rep_rows"])
+
+    supplier_busy = deepcopy(core_result["supplier_busy"])
+    rep_busy = deepcopy(core_result["rep_busy"])
+    innovation_sessions = core_result["innovation_sessions"]
+
+    sup_summary = deepcopy(core_result["summary"])
+    phase1 = core_result["phase1"]
+
+    # Power Pairings
+    build_phase2_power_pairings(
+        phase1, sellers_opp_df,
+        supplier_busy, rep_busy,
+        supplier_rows, rep_rows,
+        sup_summary, rng
+    )
+
+    # 🔹 Pass B: fill innovation to 100
+    # fill_innovation_sessions_to_capacity(
+    #     reps_df,
+    #     innovation_sessions,
+    #     rep_busy,
+    #     rep_rows,
+    #     rng
+    # )
+
+    return {
+        "seed": seed,
+        "supplier_sched": pd.DataFrame(supplier_rows),
+        "rep_sched": pd.DataFrame(rep_rows),
+        "summary": sup_summary
+    }
+
+
+
+def count_unfulfilled(summary):
+    total = 0
+    suppliers = 0
+
+    for s, v in summary.items():
+        n = len(v.get("unfulfilled", []))
+        if n > 0:
+            suppliers += 1
+            total += n
+
+    return total, suppliers
+
+def run_scheduler(preferences, reps_df, sellers_opp_df, core_seeds=10, addon_seeds=10):
+    core_best = None
+    core_diagnostics = []
+
+    # Phase A: Core seed search
+    for seed in range(core_seeds):
+        print(f"Running core scheduler seed {seed}")
+
+        result = build_phase3_core_scheduler(
+            preferences, reps_df, sellers_opp_df, seed
+        )
+
+        total_un = result["validation"]["total_unfulfilled"]
+        num_suppliers_un = len(result["validation"]["unfulfilled_detail"])
+
+        core_diagnostics.append({
+            "seed": seed,
+            "total_unfulfilled": total_un,
+            "num_suppliers_unfulfilled": num_suppliers_un
         })
 
-        # track best
-        if best_output is None or fail_total < best_output["fail_total"]:
-            best_output = {
-                "seed": s,
-                "fail_total": fail_total,
-                "fail_peak": fail_peak,
-                "fail_acc": fail_acc,
-                "supplier_schedule": supplier_schedule,
-                "reps_schedule": reps_schedule,
-                "sup_summary": sup_summary,
-                "validation": validation
-            }
+        if core_best is None:
+            core_best = result
+            continue
 
-    # package as tuple to match Phase 3 return style
+        prev_un = core_best["validation"]["total_unfulfilled"]
+        prev_sup = len(core_best["validation"]["unfulfilled_detail"])
+
+        if (total_un < prev_un) or (
+            total_un == prev_un and num_suppliers_un < prev_sup
+        ):
+            core_best = result
+
+    print(f"Selected best core seed {core_best['seed']}")
+
+    # Phase B: Extension seed search
+    extended_best = None
+
+    for seed in range(addon_seeds):
+        print(f"Running extension seed {seed}")
+
+        extended = extend_with_addons(
+            core_best, reps_df, sellers_opp_df, seed
+        )
+
+        total_un, suppliers_un = count_unfulfilled(extended["summary"])
+
+        if extended_best is None:
+            extended_best = extended
+            best_un = total_un
+            best_sup = suppliers_un
+            best_var = extended["rep_sched"]["rep"].value_counts().std()
+            continue
+
+        # Primary: fewer unfulfilled
+        if total_un < best_un:
+            extended_best = extended
+            best_un = total_un
+            best_sup = suppliers_un
+            best_var = extended["rep_sched"]["rep"].value_counts().std()
+            continue
+
+        # Secondary: fewer suppliers impacted
+        if total_un == best_un and suppliers_un < best_sup:
+            extended_best = extended
+            best_sup = suppliers_un
+            best_var = extended["rep_sched"]["rep"].value_counts().std()
+            continue
+
+        # Optional tertiary: smoother rep load
+        if total_un == best_un and suppliers_un == best_sup:
+            rep_var = extended["rep_sched"]["rep"].value_counts().std()
+            if rep_var < best_var:
+                extended_best = extended
+                best_var = rep_var
+
+    print(
+        f"Selected best extension seed {extended_best['seed']} "
+        f"(unfulfilled={best_un}, suppliers={best_sup})"
+    )
+
     return (
-        best_output["supplier_schedule"],
-        best_output["reps_schedule"],
-        best_output["sup_summary"],
-        best_output["validation"]
+        extended_best["supplier_sched"],
+        extended_best["rep_sched"],
+        extended_best["summary"],
+        core_best["validation"],
+        # core_best["phase1"]
     )
 
